@@ -216,12 +216,42 @@ struct OpenAIToolCallResponse {
 }
 
 /// OpenAI token usage.
+///
+/// `prompt_tokens` already includes any cached portion;
+/// `prompt_tokens_details.cached_tokens` is the *subset* served from
+/// prefix cache. SiliconFlow / DeepSeek emit this field on cache-eligible
+/// requests (see SiliconFlow chat-completions API docs); vanilla OpenAI
+/// emits it on cached-prefix-enabled models. When absent we treat
+/// `cached_tokens` as 0.
 #[derive(Debug, Deserialize)]
 struct OpenAIUsage {
-    /// Tokens in the prompt
+    /// Tokens in the prompt (includes cached subset).
     prompt_tokens: u32,
-    /// Tokens in the completion
+    /// Tokens in the completion.
     completion_tokens: u32,
+    /// Optional breakdown of `prompt_tokens` (newer OpenAI-compatible
+    /// schema; SiliconFlow / DeepSeek expose `cached_tokens` here).
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
+}
+
+/// Breakdown sub-object inside `usage.prompt_tokens_details`.
+#[derive(Debug, Deserialize, Default)]
+struct OpenAIPromptTokensDetails {
+    /// Subset of `prompt_tokens` served from prefix cache. Defaults to 0
+    /// when the upstream omits it.
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+impl OpenAIUsage {
+    /// Pull the cached-token figure out of the optional nested details.
+    fn cached_tokens(&self) -> u32 {
+        self.prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0)
+    }
 }
 
 /// OpenAI streaming chunk response body.
@@ -638,8 +668,15 @@ fn convert_response(response: OpenAIResponse) -> LLMResponse {
     };
 
     if let Some(usage) = response.usage {
-        llm_response =
-            llm_response.with_usage(Usage::new(usage.prompt_tokens, usage.completion_tokens));
+        // OpenAI / SiliconFlow / DeepSeek: prompt_tokens already includes the
+        // cached subset; cache_creation_tokens is always 0 on this protocol.
+        let cached = usage.cached_tokens();
+        llm_response = llm_response.with_usage(Usage::with_cache(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            cached,
+            0,
+        ));
     }
 
     llm_response
@@ -683,9 +720,12 @@ fn apply_stream_chunk(
     usage: &mut Option<Usage>,
 ) -> Vec<String> {
     if let Some(chunk_usage) = chunk.usage {
-        *usage = Some(Usage::new(
+        let cached = chunk_usage.cached_tokens();
+        *usage = Some(Usage::with_cache(
             chunk_usage.prompt_tokens,
             chunk_usage.completion_tokens,
+            cached,
+            0,
         ));
     }
 
@@ -1324,6 +1364,7 @@ mod tests {
             usage: Some(OpenAIUsage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
+                prompt_tokens_details: None,
             }),
         };
         let converted = convert_response(response);
@@ -1336,6 +1377,66 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn test_convert_response_with_cached_tokens() {
+        // SiliconFlow / DeepSeek emits prompt_tokens_details.cached_tokens
+        // when the prefix cache is hit. Verify we map it to Usage.cached_tokens.
+        let response = OpenAIResponse {
+            choices: vec![OpenAIChoice {
+                message: OpenAIResponseMessage {
+                    content: Some("Hi".to_string()),
+                    tool_calls: None,
+                },
+            }],
+            usage: Some(OpenAIUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 50,
+                prompt_tokens_details: Some(OpenAIPromptTokensDetails { cached_tokens: 800 }),
+            }),
+        };
+        let converted = convert_response(response);
+        let usage = converted.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 1050);
+        assert_eq!(usage.cached_tokens, 800);
+        assert_eq!(usage.cache_creation_tokens, 0); // never set on OpenAI protocol
+        assert!((usage.cache_hit_ratio() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_openai_usage_deserialize_with_details() {
+        // Verify the JSON shape SiliconFlow / DeepSeek actually returns
+        // round-trips through serde without losing the cached_tokens field.
+        let raw = r#"{
+            "prompt_tokens": 1234,
+            "completion_tokens": 56,
+            "prompt_tokens_details": {"cached_tokens": 1024}
+        }"#;
+        let parsed: OpenAIUsage = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.prompt_tokens, 1234);
+        assert_eq!(parsed.completion_tokens, 56);
+        assert_eq!(parsed.cached_tokens(), 1024);
+    }
+
+    #[test]
+    fn test_openai_usage_deserialize_without_details() {
+        // Older / minimal OpenAI responses omit prompt_tokens_details entirely.
+        let raw = r#"{"prompt_tokens": 100, "completion_tokens": 20}"#;
+        let parsed: OpenAIUsage = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.cached_tokens(), 0);
+    }
+
+    #[test]
+    fn test_openai_usage_deserialize_empty_details() {
+        // prompt_tokens_details present but cached_tokens omitted: still 0.
+        let raw = r#"{"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {}}"#;
+        let parsed: OpenAIUsage = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.cached_tokens(), 0);
     }
 
     #[test]
@@ -1565,6 +1666,7 @@ mod tests {
             usage: Some(OpenAIUsage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
+                prompt_tokens_details: None,
             }),
         };
 
@@ -1580,6 +1682,39 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn test_apply_stream_chunk_with_cached_tokens() {
+        let chunk = OpenAIStreamChunk {
+            choices: vec![OpenAIStreamChoice {
+                delta: OpenAIStreamDelta {
+                    content: Some("ok".to_string()),
+                    tool_calls: None,
+                },
+            }],
+            usage: Some(OpenAIUsage {
+                prompt_tokens: 2000,
+                completion_tokens: 30,
+                prompt_tokens_details: Some(OpenAIPromptTokensDetails {
+                    cached_tokens: 1500,
+                }),
+            }),
+        };
+
+        let mut assembled = String::new();
+        let mut pending_tool_calls = Vec::new();
+        let mut usage = None;
+
+        let _ = apply_stream_chunk(chunk, &mut assembled, &mut pending_tool_calls, &mut usage);
+
+        let usage = usage.expect("usage should be set");
+        assert_eq!(usage.prompt_tokens, 2000);
+        assert_eq!(usage.cached_tokens, 1500);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert!((usage.cache_hit_ratio() - 0.75).abs() < 1e-9);
     }
 
     // ========================================================================

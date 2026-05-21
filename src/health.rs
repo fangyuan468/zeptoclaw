@@ -364,6 +364,12 @@ pub struct UsageMetrics {
     pub input_tokens: AtomicU64,
     /// Total output tokens produced.
     pub output_tokens: AtomicU64,
+    /// Cumulative subset of `input_tokens` served from prompt-cache.
+    /// Populated by [`record_tokens_with_cache`]; left at 0 when callers
+    /// use the legacy [`record_tokens`].
+    pub cached_tokens: AtomicU64,
+    /// Cumulative cache-creation input tokens (Anthropic prompt-cache write).
+    pub cache_creation_tokens: AtomicU64,
     /// Total errors encountered.
     pub errors: AtomicU64,
     /// Whether the gateway is ready to accept requests.
@@ -378,6 +384,8 @@ impl UsageMetrics {
             tool_calls: AtomicU64::new(0),
             input_tokens: AtomicU64::new(0),
             output_tokens: AtomicU64::new(0),
+            cached_tokens: AtomicU64::new(0),
+            cache_creation_tokens: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             ready: AtomicBool::new(false),
         }
@@ -393,10 +401,30 @@ impl UsageMetrics {
         self.tool_calls.fetch_add(count, Ordering::Relaxed);
     }
 
-    /// Record token usage from an LLM response.
+    /// Record token usage from an LLM response (no cache breakdown).
+    ///
+    /// Equivalent to `record_tokens_with_cache(input, output, 0, 0)`.
     pub fn record_tokens(&self, input: u64, output: u64) {
+        self.record_tokens_with_cache(input, output, 0, 0);
+    }
+
+    /// Record token usage including cache-bucket breakdown.
+    ///
+    /// `cached` and `cache_creation` are *subsets* of the reported `input`
+    /// value (matching [`crate::providers::Usage`] semantics) — they are
+    /// not additional input tokens.
+    pub fn record_tokens_with_cache(
+        &self,
+        input: u64,
+        output: u64,
+        cached: u64,
+        cache_creation: u64,
+    ) {
         self.input_tokens.fetch_add(input, Ordering::Relaxed);
         self.output_tokens.fetch_add(output, Ordering::Relaxed);
+        self.cached_tokens.fetch_add(cached, Ordering::Relaxed);
+        self.cache_creation_tokens
+            .fetch_add(cache_creation, Ordering::Relaxed);
     }
 
     /// Increment the error counter.
@@ -409,15 +437,37 @@ impl UsageMetrics {
         self.ready.store(ready, Ordering::SeqCst);
     }
 
+    /// Cumulative cache-hit ratio: `cached_tokens / input_tokens` in
+    /// `[0.0, 1.0]`. Returns 0.0 when no input has been recorded.
+    pub fn cache_hit_ratio(&self) -> f64 {
+        let input = self.input_tokens.load(Ordering::Relaxed);
+        if input == 0 {
+            return 0.0;
+        }
+        let cached = self.cached_tokens.load(Ordering::Relaxed);
+        cached as f64 / input as f64
+    }
+
     /// Emit current counters as a structured log line.
     pub fn emit_usage(&self, reason: &str) {
+        let input_tokens = self.input_tokens.load(Ordering::Relaxed);
+        let cached_tokens = self.cached_tokens.load(Ordering::Relaxed);
+        let cache_creation_tokens = self.cache_creation_tokens.load(Ordering::Relaxed);
+        let cache_hit_ratio = if input_tokens == 0 {
+            0.0
+        } else {
+            cached_tokens as f64 / input_tokens as f64
+        };
         info!(
             event = "usage_summary",
             reason = reason,
             requests = self.requests.load(Ordering::Relaxed),
             tool_calls = self.tool_calls.load(Ordering::Relaxed),
-            input_tokens = self.input_tokens.load(Ordering::Relaxed),
+            input_tokens = input_tokens,
             output_tokens = self.output_tokens.load(Ordering::Relaxed),
+            cached_tokens = cached_tokens,
+            cache_creation_tokens = cache_creation_tokens,
+            cache_hit_ratio = cache_hit_ratio,
             errors = self.errors.load(Ordering::Relaxed),
             "Usage metrics"
         );

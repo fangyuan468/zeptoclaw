@@ -53,6 +53,11 @@ pub struct MetricsCollector {
     session_start: Instant,
     total_tokens_in: Mutex<u64>,
     total_tokens_out: Mutex<u64>,
+    /// Cumulative subset of `total_tokens_in` that hit prompt-cache.
+    /// Populated by `record_tokens_with_cache`; `record_tokens` leaves it 0.
+    total_tokens_cached: Mutex<u64>,
+    /// Cumulative `cache_creation_input_tokens` (Anthropic only).
+    total_tokens_cache_creation: Mutex<u64>,
 }
 
 impl MetricsCollector {
@@ -63,6 +68,8 @@ impl MetricsCollector {
             session_start: Instant::now(),
             total_tokens_in: Mutex::new(0),
             total_tokens_out: Mutex::new(0),
+            total_tokens_cached: Mutex::new(0),
+            total_tokens_cache_creation: Mutex::new(0),
         }
     }
 
@@ -92,9 +99,31 @@ impl MetricsCollector {
     }
 
     /// Adds to the running token totals.
+    ///
+    /// Treats this call as having no cache stats; `total_tokens_cached`
+    /// and `total_tokens_cache_creation` are left unchanged. Use
+    /// [`record_tokens_with_cache`] to record cache breakdowns.
     pub fn record_tokens(&self, input_tokens: u64, output_tokens: u64) {
+        self.record_tokens_with_cache(input_tokens, output_tokens, 0, 0);
+    }
+
+    /// Adds to the running token totals including cache breakdown.
+    ///
+    /// `cached_tokens` and `cache_creation_tokens` are *subsets* of the
+    /// reported `input_tokens` value, not additional input. Pass them
+    /// straight from `crate::providers::Usage` (after PR2's
+    /// `Usage::with_cache` parsing).
+    pub fn record_tokens_with_cache(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        cache_creation_tokens: u64,
+    ) {
         *self.total_tokens_in.lock().unwrap() += input_tokens;
         *self.total_tokens_out.lock().unwrap() += output_tokens;
+        *self.total_tokens_cached.lock().unwrap() += cached_tokens;
+        *self.total_tokens_cache_creation.lock().unwrap() += cache_creation_tokens;
     }
 
     /// Returns a clone of the metrics for a specific tool, or `None` if the
@@ -120,6 +149,30 @@ impl MetricsCollector {
         let input = *self.total_tokens_in.lock().unwrap();
         let output = *self.total_tokens_out.lock().unwrap();
         (input, output)
+    }
+
+    /// Returns the cumulative cached input tokens (subset of `input` from
+    /// [`total_tokens`]).
+    pub fn total_cached_tokens(&self) -> u64 {
+        *self.total_tokens_cached.lock().unwrap()
+    }
+
+    /// Returns the cumulative cache-creation input tokens (subset of
+    /// `input` from [`total_tokens`], Anthropic-only).
+    pub fn total_cache_creation_tokens(&self) -> u64 {
+        *self.total_tokens_cache_creation.lock().unwrap()
+    }
+
+    /// Cumulative cache-hit ratio: `total_tokens_cached / total_tokens_in`
+    /// in `[0.0, 1.0]`. Returns 0.0 when no input tokens have been
+    /// recorded.
+    pub fn cache_hit_ratio(&self) -> f64 {
+        let input = *self.total_tokens_in.lock().unwrap();
+        if input == 0 {
+            return 0.0;
+        }
+        let cached = *self.total_tokens_cached.lock().unwrap();
+        cached as f64 / input as f64
     }
 
     /// Returns the elapsed time since the collector was created.
@@ -181,6 +234,8 @@ impl MetricsCollector {
     pub fn summary(&self) -> String {
         let tools = self.tools.lock().unwrap();
         let (tokens_in, tokens_out) = self.total_tokens();
+        let cached = self.total_cached_tokens();
+        let cache_creation = self.total_cache_creation_tokens();
         let session_secs = self.session_duration().as_secs();
 
         let total_calls: u64 = tools.values().map(|m| m.call_count).sum();
@@ -190,6 +245,14 @@ impl MetricsCollector {
             "Session: {}s | Tools: {} calls ({} errors) | Tokens: {} in / {} out",
             session_secs, total_calls, total_errors, tokens_in, tokens_out,
         );
+
+        if cached > 0 || cache_creation > 0 {
+            let hit_pct = (self.cache_hit_ratio() * 100.0).round() as u64;
+            summary.push_str(&format!(
+                " | Cache: {} hit ({}%) / {} created",
+                cached, hit_pct, cache_creation
+            ));
+        }
 
         // Sort tools by call_count descending.
         let mut entries: Vec<_> = tools.iter().collect();
@@ -301,6 +364,69 @@ mod tests {
         collector.record_tokens(1000, 600);
 
         assert_eq!(collector.total_tokens(), (1500, 800));
+        // record_tokens (no-cache variant) must not touch cache counters.
+        assert_eq!(collector.total_cached_tokens(), 0);
+        assert_eq!(collector.total_cache_creation_tokens(), 0);
+        assert_eq!(collector.cache_hit_ratio(), 0.0);
+    }
+
+    #[test]
+    fn test_record_tokens_with_cache_accumulates_all_buckets() {
+        let collector = MetricsCollector::new();
+
+        // First request: cache miss (write to cache).
+        collector.record_tokens_with_cache(2000, 100, 0, 1500);
+        // Second request: cache hit on the same prefix.
+        collector.record_tokens_with_cache(2000, 80, 1500, 0);
+        // Third request: pure no-cache call.
+        collector.record_tokens_with_cache(500, 50, 0, 0);
+
+        assert_eq!(collector.total_tokens(), (4500, 230));
+        assert_eq!(collector.total_cached_tokens(), 1500);
+        assert_eq!(collector.total_cache_creation_tokens(), 1500);
+        // 1500 / 4500 = 1/3
+        let ratio = collector.cache_hit_ratio();
+        assert!(
+            (ratio - (1500.0 / 4500.0)).abs() < 1e-9,
+            "expected ~0.333, got {}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_record_tokens_delegates_to_with_cache() {
+        // Verify the legacy `record_tokens` is just `record_tokens_with_cache`
+        // with zero cache buckets (no double-count, no implicit assumptions).
+        let collector = MetricsCollector::new();
+        collector.record_tokens(1000, 300);
+        assert_eq!(collector.total_tokens(), (1000, 300));
+        assert_eq!(collector.total_cached_tokens(), 0);
+        assert_eq!(collector.cache_hit_ratio(), 0.0);
+    }
+
+    #[test]
+    fn test_cache_hit_ratio_zero_input() {
+        let collector = MetricsCollector::new();
+        assert_eq!(collector.cache_hit_ratio(), 0.0);
+    }
+
+    #[test]
+    fn test_summary_omits_cache_section_when_no_cache_activity() {
+        let collector = MetricsCollector::new();
+        collector.record_tokens(100, 50);
+        collector.record_tool_call("shell", Duration::from_millis(10), true);
+        let summary = collector.summary();
+        assert!(!summary.contains("Cache:"), "got: {}", summary);
+    }
+
+    #[test]
+    fn test_summary_includes_cache_section_when_cache_seen() {
+        let collector = MetricsCollector::new();
+        collector.record_tokens_with_cache(1000, 100, 800, 0);
+        let summary = collector.summary();
+        assert!(summary.contains("Cache: 800 hit"), "got: {}", summary);
+        // 800/1000 = 80%
+        assert!(summary.contains("(80%)"), "got: {}", summary);
     }
 
     #[test]

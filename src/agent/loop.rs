@@ -568,7 +568,9 @@ fn parse_mermaid_xychart_spec(content: &str) -> Option<MermaidXyChartSpec> {
         return None;
     }
     if labels.len() != values.len() {
-        labels = (1..=values.len()).map(|idx| format!("Item {}", idx)).collect();
+        labels = (1..=values.len())
+            .map(|idx| format!("Item {}", idx))
+            .collect();
     }
     let computed_max = values.iter().copied().max().unwrap_or(1).max(1);
     let y_max = y_max.unwrap_or(computed_max).max(computed_max);
@@ -880,8 +882,7 @@ async fn resolve_tool_approval(
     // The matcher is `Copy + cheap`; we instantiate one per call rather
     // than holding it on the agent because it's stateless and shaves
     // a constructor argument off `resolve_tool_approval`.
-    let hard_floor =
-        crate::tools::hard_floor::HardFloorMatcher::default().check(tool_name, args);
+    let hard_floor = crate::tools::hard_floor::HardFloorMatcher::default().check(tool_name, args);
 
     if hard_floor.is_none() && !gate.requires_approval(tool_name) {
         return None;
@@ -2131,11 +2132,20 @@ impl AgentLoop {
         thinking_scope.finish(thinking_detail.as_deref()).await;
 
         if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref()) {
-            metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+            metrics.record_tokens_with_cache(
+                usage.prompt_tokens as u64,
+                usage.completion_tokens as u64,
+                usage.cached_tokens as u64,
+                usage.cache_creation_tokens as u64,
+            );
         }
         if let Some(usage) = response.usage.as_ref() {
-            metrics_collector
-                .record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+            metrics_collector.record_tokens_with_cache(
+                usage.prompt_tokens as u64,
+                usage.completion_tokens as u64,
+                usage.cached_tokens as u64,
+                usage.cache_creation_tokens as u64,
+            );
             self.token_budget
                 .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
         }
@@ -2683,12 +2693,20 @@ impl AgentLoop {
                 if let (Some(metrics), Some(usage)) =
                     (usage_metrics.as_ref(), response.usage.as_ref())
                 {
-                    metrics
-                        .record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                    metrics.record_tokens_with_cache(
+                        usage.prompt_tokens as u64,
+                        usage.completion_tokens as u64,
+                        usage.cached_tokens as u64,
+                        usage.cache_creation_tokens as u64,
+                    );
                 }
                 if let Some(usage) = response.usage.as_ref() {
-                    metrics_collector
-                        .record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                    metrics_collector.record_tokens_with_cache(
+                        usage.prompt_tokens as u64,
+                        usage.completion_tokens as u64,
+                        usage.cached_tokens as u64,
+                        usage.cache_creation_tokens as u64,
+                    );
                     self.token_budget
                         .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
                 }
@@ -2846,11 +2864,20 @@ impl AgentLoop {
 
             if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref())
             {
-                metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                metrics.record_tokens_with_cache(
+                    usage.prompt_tokens as u64,
+                    usage.completion_tokens as u64,
+                    usage.cached_tokens as u64,
+                    usage.cache_creation_tokens as u64,
+                );
             }
             if let Some(usage) = response.usage.as_ref() {
-                metrics_collector
-                    .record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                metrics_collector.record_tokens_with_cache(
+                    usage.prompt_tokens as u64,
+                    usage.completion_tokens as u64,
+                    usage.cached_tokens as u64,
+                    usage.cache_creation_tokens as u64,
+                );
                 self.token_budget
                     .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
             }
@@ -3127,11 +3154,20 @@ impl AgentLoop {
         let thinking_detail = build_thinking_detail(&response);
         thinking_scope.finish(thinking_detail.as_deref()).await;
         if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref()) {
-            metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+            metrics.record_tokens_with_cache(
+                usage.prompt_tokens as u64,
+                usage.completion_tokens as u64,
+                usage.cached_tokens as u64,
+                usage.cache_creation_tokens as u64,
+            );
         }
         if let Some(usage) = response.usage.as_ref() {
-            metrics_collector
-                .record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+            metrics_collector.record_tokens_with_cache(
+                usage.prompt_tokens as u64,
+                usage.completion_tokens as u64,
+                usage.cached_tokens as u64,
+                usage.cache_creation_tokens as u64,
+            );
             self.token_budget
                 .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
         }
@@ -3728,11 +3764,20 @@ impl AgentLoop {
             thinking_scope.finish(thinking_detail.as_deref()).await;
             if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref())
             {
-                metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                metrics.record_tokens_with_cache(
+                    usage.prompt_tokens as u64,
+                    usage.completion_tokens as u64,
+                    usage.cached_tokens as u64,
+                    usage.cache_creation_tokens as u64,
+                );
             }
             if let Some(usage) = response.usage.as_ref() {
-                metrics_collector
-                    .record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                metrics_collector.record_tokens_with_cache(
+                    usage.prompt_tokens as u64,
+                    usage.completion_tokens as u64,
+                    usage.cached_tokens as u64,
+                    usage.cache_creation_tokens as u64,
+                );
                 self.token_budget
                     .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
             }
@@ -3799,14 +3844,18 @@ impl AgentLoop {
                         StreamEvent::Done { content, usage } => {
                             if let Some(usage) = usage.as_ref() {
                                 if let Some(metrics) = usage_metrics.as_ref() {
-                                    metrics.record_tokens(
+                                    metrics.record_tokens_with_cache(
                                         usage.prompt_tokens as u64,
                                         usage.completion_tokens as u64,
+                                        usage.cached_tokens as u64,
+                                        usage.cache_creation_tokens as u64,
                                     );
                                 }
-                                metrics_collector.record_tokens(
+                                metrics_collector.record_tokens_with_cache(
                                     usage.prompt_tokens as u64,
                                     usage.completion_tokens as u64,
+                                    usage.cached_tokens as u64,
+                                    usage.cache_creation_tokens as u64,
                                 );
                             }
                             session.add_message(Message::assistant(content));
@@ -4301,12 +4350,12 @@ impl AgentLoop {
                 let latency_ms = start.elapsed().as_millis() as u64;
                 let (input_tokens, output_tokens) =
                     Self::token_delta(usage_metrics.as_ref(), tokens_before);
-                let (cleaned_final_content, a2ui_messages) = if supports_custom_ui_channel(&msg.channel)
-                {
-                    extract_a2ui_messages_from_response(&final_content)
-                } else {
-                    (final_content.clone(), Vec::new())
-                };
+                let (cleaned_final_content, a2ui_messages) =
+                    if supports_custom_ui_channel(&msg.channel) {
+                        extract_a2ui_messages_from_response(&final_content)
+                    } else {
+                        (final_content.clone(), Vec::new())
+                    };
                 if !a2ui_messages.is_empty() {
                     emit_a2ui_messages(&self.bus, &msg.channel, &msg.chat_id, &a2ui_messages).await;
                 }
@@ -4854,12 +4903,18 @@ xychart-beta
         let (cleaned, messages) = extract_a2ui_messages_from_response(raw);
         assert_eq!(cleaned, "");
         assert_eq!(messages.len(), 2, "should emit create+update A2UI messages");
-        assert!(messages
-            .iter()
-            .any(|msg| msg.get("createSurface").is_some()), "missing createSurface");
-        assert!(messages
-            .iter()
-            .any(|msg| msg.get("updateComponents").is_some()), "missing updateComponents");
+        assert!(
+            messages
+                .iter()
+                .any(|msg| msg.get("createSurface").is_some()),
+            "missing createSurface"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|msg| msg.get("updateComponents").is_some()),
+            "missing updateComponents"
+        );
     }
 
     #[test]
@@ -6571,10 +6626,7 @@ tail line
     async fn hard_floor_forces_approval_even_when_gate_allows() {
         let gate = allow_all_gate();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let handler = capture_handler(
-            std::sync::Arc::clone(&seen),
-            ApprovalResponse::Approved,
-        );
+        let handler = capture_handler(std::sync::Arc::clone(&seen), ApprovalResponse::Approved);
         let identity = unknown_identity();
 
         // `rm -rf /` matches `rm_rf_root` → handler must be invoked
@@ -6612,10 +6664,7 @@ tail line
         // no regular approval, handler never invoked, fn returns None.
         let gate = allow_all_gate();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let handler = capture_handler(
-            std::sync::Arc::clone(&seen),
-            ApprovalResponse::Approved,
-        );
+        let handler = capture_handler(std::sync::Arc::clone(&seen), ApprovalResponse::Approved);
 
         let result = resolve_tool_approval(
             &gate,
@@ -6642,10 +6691,7 @@ tail line
         // it might retry into a silent execution).
         let gate = allow_all_gate();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let handler = capture_handler(
-            std::sync::Arc::clone(&seen),
-            ApprovalResponse::TimedOut,
-        );
+        let handler = capture_handler(std::sync::Arc::clone(&seen), ApprovalResponse::TimedOut);
 
         let result = resolve_tool_approval(
             &gate,
@@ -6684,10 +6730,7 @@ tail line
             ..Default::default()
         });
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let handler = capture_handler(
-            std::sync::Arc::clone(&seen),
-            ApprovalResponse::TimedOut,
-        );
+        let handler = capture_handler(std::sync::Arc::clone(&seen), ApprovalResponse::TimedOut);
 
         let result = resolve_tool_approval(
             &gate,
@@ -6741,10 +6784,7 @@ tail line
         // HardFloor — it goes through whatever the regular gate says.
         let gate = allow_all_gate();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let handler = capture_handler(
-            std::sync::Arc::clone(&seen),
-            ApprovalResponse::Approved,
-        );
+        let handler = capture_handler(std::sync::Arc::clone(&seen), ApprovalResponse::Approved);
 
         let result = resolve_tool_approval(
             &gate,

@@ -156,6 +156,8 @@ impl LLMProvider for MockBudgetExhaustingProvider {
                 prompt_tokens: self.tokens_per_call,
                 completion_tokens: self.tokens_per_call,
                 total_tokens: self.tokens_per_call * 2,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
             }),
         })
     }
@@ -317,6 +319,8 @@ impl LLMProvider for MockTokenCountingProvider {
                 prompt_tokens: 500,
                 completion_tokens: 200,
                 total_tokens: 700,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
             }),
         })
     }

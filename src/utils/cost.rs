@@ -11,27 +11,47 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// Pricing for a single LLM model, expressed in USD per million tokens.
+///
+/// `cached_input_cost_per_million` and `cache_creation_cost_per_million`
+/// are optional; when `None`, the corresponding token bucket is billed at
+/// the full `input_cost_per_million` rate (i.e. behaves as if the
+/// provider has no cache discount). For DeepSeek/SiliconFlow the cached
+/// rate is typically 10% of input; for Anthropic prompt-caching the
+/// cached rate is 10% and cache_creation is ~125% of input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
-    /// Cost per 1 000 000 input (prompt) tokens in USD.
+    /// Cost per 1 000 000 input (prompt) tokens in USD, full rate.
     pub input_cost_per_million: f64,
     /// Cost per 1 000 000 output (completion) tokens in USD.
     pub output_cost_per_million: f64,
+    /// Cost per 1 000 000 cached input tokens in USD (prompt-cache hit).
+    /// `None` ⇒ falls back to `input_cost_per_million`.
+    #[serde(default)]
+    pub cached_input_cost_per_million: Option<f64>,
+    /// Cost per 1 000 000 cache-creation input tokens in USD (Anthropic
+    /// prompt-cache write rate). `None` ⇒ falls back to
+    /// `input_cost_per_million`.
+    #[serde(default)]
+    pub cache_creation_cost_per_million: Option<f64>,
 }
 
 /// Returns a static map of known model pricing.
 ///
 /// Prices are in USD per million tokens and reflect public list prices at
-/// the time of writing.
+/// the time of writing. Cache-rate fields are populated only for providers
+/// where the discount is publicly documented.
 pub fn default_pricing() -> HashMap<String, ModelPricing> {
     let mut m = HashMap::new();
 
-    // Anthropic Claude models
+    // Anthropic Claude models. Anthropic prompt-cache: read = 10% of input,
+    // write = 125% of input (Sonnet/Opus tier; Haiku follows the same ratio).
     m.insert(
         "claude-sonnet-4-6".to_string(),
         ModelPricing {
             input_cost_per_million: 3.0,
             output_cost_per_million: 15.0,
+            cached_input_cost_per_million: Some(0.30),
+            cache_creation_cost_per_million: Some(3.75),
         },
     );
     m.insert(
@@ -39,6 +59,8 @@ pub fn default_pricing() -> HashMap<String, ModelPricing> {
         ModelPricing {
             input_cost_per_million: 3.0,
             output_cost_per_million: 15.0,
+            cached_input_cost_per_million: Some(0.30),
+            cache_creation_cost_per_million: Some(3.75),
         },
     );
     m.insert(
@@ -46,6 +68,8 @@ pub fn default_pricing() -> HashMap<String, ModelPricing> {
         ModelPricing {
             input_cost_per_million: 3.0,
             output_cost_per_million: 15.0,
+            cached_input_cost_per_million: Some(0.30),
+            cache_creation_cost_per_million: Some(3.75),
         },
     );
     m.insert(
@@ -53,6 +77,8 @@ pub fn default_pricing() -> HashMap<String, ModelPricing> {
         ModelPricing {
             input_cost_per_million: 15.0,
             output_cost_per_million: 75.0,
+            cached_input_cost_per_million: Some(1.50),
+            cache_creation_cost_per_million: Some(18.75),
         },
     );
     m.insert(
@@ -60,6 +86,8 @@ pub fn default_pricing() -> HashMap<String, ModelPricing> {
         ModelPricing {
             input_cost_per_million: 15.0,
             output_cost_per_million: 75.0,
+            cached_input_cost_per_million: Some(1.50),
+            cache_creation_cost_per_million: Some(18.75),
         },
     );
     m.insert(
@@ -67,15 +95,20 @@ pub fn default_pricing() -> HashMap<String, ModelPricing> {
         ModelPricing {
             input_cost_per_million: 0.25,
             output_cost_per_million: 1.25,
+            cached_input_cost_per_million: Some(0.025),
+            cache_creation_cost_per_million: Some(0.3125),
         },
     );
 
-    // OpenAI models
+    // OpenAI models. OpenAI cached-input rate is 50% of input on
+    // cached-prefix-enabled models; cache_creation is N/A on this protocol.
     m.insert(
         "gpt-5.1".to_string(),
         ModelPricing {
             input_cost_per_million: 2.5,
             output_cost_per_million: 10.0,
+            cached_input_cost_per_million: Some(1.25),
+            cache_creation_cost_per_million: None,
         },
     );
     m.insert(
@@ -83,6 +116,8 @@ pub fn default_pricing() -> HashMap<String, ModelPricing> {
         ModelPricing {
             input_cost_per_million: 0.15,
             output_cost_per_million: 0.6,
+            cached_input_cost_per_million: Some(0.075),
+            cache_creation_cost_per_million: None,
         },
     );
     m.insert(
@@ -90,32 +125,82 @@ pub fn default_pricing() -> HashMap<String, ModelPricing> {
         ModelPricing {
             input_cost_per_million: 10.0,
             output_cost_per_million: 30.0,
+            cached_input_cost_per_million: None,
+            cache_creation_cost_per_million: None,
         },
     );
 
     m
 }
 
-/// Estimate the cost of a single LLM call in USD.
+/// Estimate the cost of a single LLM call in USD (no cache breakdown).
 ///
 /// Looks up pricing in `custom_pricing` first, then falls back to
 /// [`default_pricing`]. Returns `None` if the model is unknown in both.
+///
+/// All `prompt_tokens` are billed at the full input rate. To take the
+/// per-bucket cache discount into account, use [`estimate_cost_with_cache`].
 pub fn estimate_cost(
     model: &str,
     prompt_tokens: u32,
     completion_tokens: u32,
     custom_pricing: &HashMap<String, ModelPricing>,
 ) -> Option<f64> {
-    // Resolve the lookup in two steps so that the owned `defaults` HashMap
+    estimate_cost_with_cache(
+        model,
+        prompt_tokens,
+        completion_tokens,
+        0,
+        0,
+        custom_pricing,
+    )
+}
+
+/// Estimate the cost of a single LLM call in USD, billing each input
+/// bucket at its own rate.
+///
+/// `cached_tokens` and `cache_creation_tokens` are *subsets* of
+/// `prompt_tokens` (matching the [`crate::providers::Usage`] convention):
+/// `non_cached = prompt_tokens − cached_tokens − cache_creation_tokens`.
+/// The non-cached portion is billed at `input_cost_per_million`; cached
+/// and cache-creation portions fall back to `input_cost_per_million` when
+/// the model's pricing entry leaves the corresponding optional rate as
+/// `None` (i.e. no discount declared).
+///
+/// If `cached + cache_creation` exceeds `prompt_tokens` (malformed input
+/// from the upstream API), `non_cached` is clamped to 0 to avoid a
+/// negative bill.
+pub fn estimate_cost_with_cache(
+    model: &str,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_tokens: u32,
+    cache_creation_tokens: u32,
+    custom_pricing: &HashMap<String, ModelPricing>,
+) -> Option<f64> {
+    // Resolve the lookup in two steps so the owned `defaults` HashMap
     // lives long enough for the borrow returned by `.get()`.
     let defaults = default_pricing();
-    let pricing = custom_pricing.get(model).or_else(|| defaults.get(model));
+    let pricing = custom_pricing.get(model).or_else(|| defaults.get(model))?;
 
-    pricing.map(|p| {
-        let input_cost = (prompt_tokens as f64 / 1_000_000.0) * p.input_cost_per_million;
-        let output_cost = (completion_tokens as f64 / 1_000_000.0) * p.output_cost_per_million;
-        input_cost + output_cost
-    })
+    let cached = cached_tokens as u64;
+    let cache_creation = cache_creation_tokens as u64;
+    let prompt = prompt_tokens as u64;
+    // Defensive clamp for malformed upstream payloads.
+    let non_cached = prompt.saturating_sub(cached).saturating_sub(cache_creation);
+
+    let cached_rate = pricing
+        .cached_input_cost_per_million
+        .unwrap_or(pricing.input_cost_per_million);
+    let cache_creation_rate = pricing
+        .cache_creation_cost_per_million
+        .unwrap_or(pricing.input_cost_per_million);
+
+    let non_cached_cost = (non_cached as f64 / 1_000_000.0) * pricing.input_cost_per_million;
+    let cached_cost = (cached as f64 / 1_000_000.0) * cached_rate;
+    let cache_creation_cost = (cache_creation as f64 / 1_000_000.0) * cache_creation_rate;
+    let output_cost = (completion_tokens as f64 / 1_000_000.0) * pricing.output_cost_per_million;
+    Some(non_cached_cost + cached_cost + cache_creation_cost + output_cost)
 }
 
 /// Internal mutable state guarded by the `CostTracker` mutex.
@@ -156,15 +241,36 @@ impl CostTracker {
         }
     }
 
-    /// Record a single LLM call.
+    /// Record a single LLM call (no cache breakdown).
     ///
-    /// Estimates cost (if the model is known) and accumulates it under both
-    /// the provider name and the model name.
+    /// Estimates cost at full input rate (if the model is known) and
+    /// accumulates it under both the provider name and the model name.
+    /// Equivalent to `record_with_cache(provider, model, prompt, completion, 0, 0)`.
     pub fn record(&self, provider: &str, model: &str, prompt_tokens: u32, completion_tokens: u32) {
-        let cost = estimate_cost(
+        self.record_with_cache(provider, model, prompt_tokens, completion_tokens, 0, 0);
+    }
+
+    /// Record a single LLM call with cache-bucket breakdown.
+    ///
+    /// `cached_tokens` and `cache_creation_tokens` are *subsets* of
+    /// `prompt_tokens` and are billed at their respective per-million
+    /// rates from [`ModelPricing`] (falling back to the full input rate
+    /// when not configured).
+    pub fn record_with_cache(
+        &self,
+        provider: &str,
+        model: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: u32,
+        cache_creation_tokens: u32,
+    ) {
+        let cost = estimate_cost_with_cache(
             model,
             prompt_tokens,
             completion_tokens,
+            cached_tokens,
+            cache_creation_tokens,
             &self.custom_pricing,
         )
         .unwrap_or(0.0);
@@ -318,6 +424,8 @@ mod tests {
             ModelPricing {
                 input_cost_per_million: 100.0,
                 output_cost_per_million: 200.0,
+                cached_input_cost_per_million: None,
+                cache_creation_cost_per_million: None,
             },
         );
         // With custom pricing: 1000/1M * 100 + 500/1M * 200 = 0.1 + 0.1 = 0.2
@@ -333,10 +441,106 @@ mod tests {
             ModelPricing {
                 input_cost_per_million: 1.0,
                 output_cost_per_million: 2.0,
+                cached_input_cost_per_million: None,
+                cache_creation_cost_per_million: None,
             },
         );
         let cost = estimate_cost("my-custom-model", 1_000_000, 1_000_000, &custom).unwrap();
         assert!((cost - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_estimate_cost_with_cache_full_hit_anthropic() {
+        // claude-sonnet-4-5: input $3/M, output $15/M, cached $0.30/M, cache_creation $3.75/M
+        // 1000 input total: 800 cached, 200 non-cached
+        // cost = 200/1M * 3.0 + 800/1M * 0.30 + 0 + 50/1M * 15.0
+        //      = 0.0006 + 0.00024 + 0 + 0.00075
+        //      = 0.00159
+        let custom = HashMap::new();
+        let cost =
+            estimate_cost_with_cache("claude-sonnet-4-5-20250929", 1000, 50, 800, 0, &custom)
+                .unwrap();
+        assert!((cost - 0.00159).abs() < 1e-10, "got {}", cost);
+    }
+
+    #[test]
+    fn test_estimate_cost_with_cache_creation_anthropic() {
+        // claude-sonnet-4-5: cache_creation $3.75/M
+        // 1000 prompt: 0 cached, 1000 cache_creation, 0 non_cached
+        // cost = 0 + 0 + 1000/1M * 3.75 + 50/1M * 15.0
+        //      = 0.00375 + 0.00075 = 0.0045
+        let custom = HashMap::new();
+        let cost =
+            estimate_cost_with_cache("claude-sonnet-4-5-20250929", 1000, 50, 0, 1000, &custom)
+                .unwrap();
+        assert!((cost - 0.0045).abs() < 1e-10, "got {}", cost);
+    }
+
+    #[test]
+    fn test_estimate_cost_with_cache_zero_buckets_matches_estimate_cost() {
+        // estimate_cost(...) is just estimate_cost_with_cache with zero
+        // buckets — verify they produce identical results.
+        let custom = HashMap::new();
+        let plain = estimate_cost("gpt-5.1", 1000, 500, &custom).unwrap();
+        let with_cache = estimate_cost_with_cache("gpt-5.1", 1000, 500, 0, 0, &custom).unwrap();
+        assert!((plain - with_cache).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_estimate_cost_with_cache_falls_back_when_rate_unset() {
+        // gpt-4-turbo declares cached_input_cost_per_million = None, so a
+        // cached request should bill cached tokens at the full input rate.
+        let custom = HashMap::new();
+        let with_cache = estimate_cost_with_cache("gpt-4-turbo", 1000, 0, 500, 0, &custom).unwrap();
+        let plain = estimate_cost("gpt-4-turbo", 1000, 0, &custom).unwrap();
+        assert!((plain - with_cache).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_estimate_cost_with_cache_clamps_overflow() {
+        // Malformed upstream: cached + cache_creation > prompt. We should
+        // clamp non_cached to 0 rather than producing negative cost.
+        let custom = HashMap::new();
+        let cost = estimate_cost_with_cache(
+            "claude-sonnet-4-5-20250929",
+            500,
+            0,
+            800, // cached > prompt
+            0,
+            &custom,
+        )
+        .unwrap();
+        // non_cached clamped to 0; cost = 0 + 800/1M * 0.30 + 0 + 0 = 0.00024
+        assert!((cost - 0.00024).abs() < 1e-10, "got {}", cost);
+    }
+
+    #[test]
+    fn test_estimate_cost_with_cache_unknown_model_returns_none() {
+        let custom = HashMap::new();
+        assert!(
+            estimate_cost_with_cache("unknown-model-xyz", 1000, 500, 100, 0, &custom).is_none()
+        );
+    }
+
+    #[test]
+    fn test_record_with_cache_uses_cache_pricing() {
+        let tracker = CostTracker::new();
+        // 1000 prompt: 800 cached, 0 cache_creation, 200 non_cached on
+        // claude-sonnet-4-5; expected cost = 0.00159 (see earlier test).
+        tracker.record_with_cache("anthropic", "claude-sonnet-4-5-20250929", 1000, 50, 800, 0);
+        assert!((tracker.total_cost() - 0.00159).abs() < 1e-10);
+        assert_eq!(tracker.call_count(), 1);
+    }
+
+    #[test]
+    fn test_record_delegates_to_record_with_cache() {
+        // Verify the legacy `record` is just `record_with_cache` with
+        // zero cache buckets — no double-count, identical totals.
+        let a = CostTracker::new();
+        let b = CostTracker::new();
+        a.record("openai", "gpt-5.1", 1000, 500);
+        b.record_with_cache("openai", "gpt-5.1", 1000, 500, 0, 0);
+        assert!((a.total_cost() - b.total_cost()).abs() < 1e-12);
     }
 
     #[test]
@@ -452,6 +656,8 @@ mod tests {
             ModelPricing {
                 input_cost_per_million: 5.0,
                 output_cost_per_million: 20.0,
+                cached_input_cost_per_million: Some(0.5),
+                cache_creation_cost_per_million: None,
             },
         );
         let config = CostConfig {
@@ -467,6 +673,8 @@ mod tests {
         let p = &parsed.custom_pricing["my-model"];
         assert!((p.input_cost_per_million - 5.0).abs() < f64::EPSILON);
         assert!((p.output_cost_per_million - 20.0).abs() < f64::EPSILON);
+        assert!((p.cached_input_cost_per_million.unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!(p.cache_creation_cost_per_million.is_none());
     }
 
     #[test]
@@ -474,6 +682,8 @@ mod tests {
         let pricing = ModelPricing {
             input_cost_per_million: 3.0,
             output_cost_per_million: 15.0,
+            cached_input_cost_per_million: Some(0.30),
+            cache_creation_cost_per_million: Some(3.75),
         };
 
         let json = serde_json::to_string(&pricing).unwrap();
@@ -481,6 +691,19 @@ mod tests {
 
         assert!((parsed.input_cost_per_million - 3.0).abs() < f64::EPSILON);
         assert!((parsed.output_cost_per_million - 15.0).abs() < f64::EPSILON);
+        assert!((parsed.cached_input_cost_per_million.unwrap() - 0.30).abs() < f64::EPSILON);
+        assert!((parsed.cache_creation_cost_per_million.unwrap() - 3.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_model_pricing_serde_legacy_payload_deserializes() {
+        // Older config files won't have the cache fields; serde defaults
+        // them to None.
+        let json = r#"{"input_cost_per_million": 1.0, "output_cost_per_million": 2.0}"#;
+        let parsed: ModelPricing = serde_json::from_str(json).unwrap();
+        assert!((parsed.input_cost_per_million - 1.0).abs() < f64::EPSILON);
+        assert!(parsed.cached_input_cost_per_million.is_none());
+        assert!(parsed.cache_creation_cost_per_million.is_none());
     }
 
     #[test]
@@ -499,6 +722,8 @@ mod tests {
             ModelPricing {
                 input_cost_per_million: 10.0,
                 output_cost_per_million: 50.0,
+                cached_input_cost_per_million: None,
+                cache_creation_cost_per_million: None,
             },
         );
         let tracker = CostTracker::new_with_pricing(custom);

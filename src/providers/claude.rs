@@ -300,6 +300,8 @@ impl LLMProvider for ClaudeProvider {
             let mut current_tool_json = String::new();
             let mut input_tokens: u32 = 0;
             let mut output_tokens: u32 = 0;
+            let mut cache_read: u32 = 0;
+            let mut cache_creation: u32 = 0;
             let mut line_buffer = String::new();
 
             tokio::pin!(byte_stream);
@@ -351,6 +353,11 @@ impl LLMProvider for ClaudeProvider {
                             if let Some(msg) = &sse.message {
                                 if let Some(usage) = &msg.usage {
                                     input_tokens = usage.input_tokens.unwrap_or(0);
+                                    // Anthropic sends cache_read / cache_creation
+                                    // in message_start.usage when prefix-cache
+                                    // is enabled. Capture them here.
+                                    cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+                                    cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
                                 }
                             }
                         }
@@ -410,7 +417,16 @@ impl LLMProvider for ClaudeProvider {
                                     .send(StreamEvent::ToolCalls(std::mem::take(&mut tool_calls)))
                                     .await;
                             }
-                            let usage = super::Usage::new(input_tokens, output_tokens);
+                            // Match the doc on `ClaudeUsage::to_shared`: shared
+                            // `Usage::prompt_tokens` carries the *total* input
+                            // including cache_read + cache_creation buckets.
+                            let total_input = input_tokens + cache_read + cache_creation;
+                            let usage = Usage::with_cache(
+                                total_input,
+                                output_tokens,
+                                cache_read,
+                                cache_creation,
+                            );
                             let _ = tx
                                 .send(StreamEvent::Done {
                                     content: assembled_content.clone(),
@@ -429,7 +445,8 @@ impl LLMProvider for ClaudeProvider {
                     .send(StreamEvent::ToolCalls(std::mem::take(&mut tool_calls)))
                     .await;
             }
-            let usage = super::Usage::new(input_tokens, output_tokens);
+            let total_input = input_tokens + cache_read + cache_creation;
+            let usage = Usage::with_cache(total_input, output_tokens, cache_read, cache_creation);
             let _ = tx
                 .send(StreamEvent::Done {
                     content: assembled_content,
@@ -582,12 +599,42 @@ struct ClaudeError {
 }
 
 /// Claude token usage.
+///
+/// Anthropic semantics differ from OpenAI: `input_tokens` only counts the
+/// **uncached** portion. `cache_read_input_tokens` and
+/// `cache_creation_input_tokens` are *separate* buckets billed at
+/// different rates (cache_read ≈ 10% of input, cache_creation ≈ 125%).
+/// Our shared `Usage` struct (`crate::providers::types::Usage`) treats
+/// `prompt_tokens` as the *total* input — so when converting we sum all
+/// three buckets into `prompt_tokens` and report `cache_read` as
+/// `cached_tokens` and `cache_creation` as `cache_creation_tokens`. This
+/// matches the OpenAI mapping where `prompt_tokens` already includes the
+/// cached subset.
 #[derive(Debug, Deserialize)]
 struct ClaudeUsage {
-    /// Tokens in the input
+    /// Tokens in the input (uncached portion only — see struct doc).
     input_tokens: u32,
-    /// Tokens in the output
+    /// Tokens in the output.
     output_tokens: u32,
+    /// Optional: tokens served from prefix cache (Anthropic prompt
+    /// caching). Absent on responses where caching is not enabled.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    /// Optional: tokens written to prefix cache for the first time on
+    /// this request.
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+}
+
+impl ClaudeUsage {
+    /// Convert Anthropic three-bucket input layout to the shared
+    /// `Usage` struct's "prompt_tokens covers everything" layout.
+    fn to_shared(&self) -> Usage {
+        let cache_read = self.cache_read_input_tokens.unwrap_or(0);
+        let cache_creation = self.cache_creation_input_tokens.unwrap_or(0);
+        let total_input = self.input_tokens + cache_read + cache_creation;
+        Usage::with_cache(total_input, self.output_tokens, cache_read, cache_creation)
+    }
 }
 
 // ============================================================================
@@ -644,6 +691,13 @@ struct SseUsage {
     input_tokens: Option<u32>,
     #[serde(default)]
     output_tokens: Option<u32>,
+    /// Anthropic prefix-cache hit count (sent in `message_start.usage`
+    /// on cache-enabled requests).
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    /// Anthropic prefix-cache write count.
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -831,7 +885,7 @@ fn convert_response(response: ClaudeResponse) -> LLMResponse {
         }
     }
 
-    let usage = Usage::new(response.usage.input_tokens, response.usage.output_tokens);
+    let usage = response.usage.to_shared();
 
     LLMResponse {
         content,
@@ -1010,6 +1064,8 @@ mod tests {
             usage: ClaudeUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
             },
             stop_reason: Some("end_turn".to_string()),
         };
@@ -1024,6 +1080,84 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn test_convert_response_with_cache_hit() {
+        // Anthropic with prefix-cache enabled: input_tokens is uncached,
+        // cache_read is the cached subset. Verify summed prompt_tokens.
+        let response = ClaudeResponse {
+            content: vec![ClaudeContentBlock::Text {
+                text: "ok".to_string(),
+            }],
+            usage: ClaudeUsage {
+                input_tokens: 200,
+                output_tokens: 50,
+                cache_read_input_tokens: Some(800),
+                cache_creation_input_tokens: None,
+            },
+            stop_reason: Some("end_turn".to_string()),
+        };
+
+        let usage = convert_response(response).usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 1000); // 200 + 800
+        assert_eq!(usage.cached_tokens, 800);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 1050);
+        assert!((usage.cache_hit_ratio() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_convert_response_with_cache_creation() {
+        // Anthropic on first request that writes to cache.
+        let response = ClaudeResponse {
+            content: vec![ClaudeContentBlock::Text {
+                text: "ok".to_string(),
+            }],
+            usage: ClaudeUsage {
+                input_tokens: 100,
+                output_tokens: 30,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: Some(1500),
+            },
+            stop_reason: Some("end_turn".to_string()),
+        };
+
+        let usage = convert_response(response).usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 1600);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 1500);
+    }
+
+    #[test]
+    fn test_claude_usage_deserialize_with_cache_fields() {
+        // Real Anthropic response shape (cache enabled).
+        let raw = r#"{
+            "input_tokens": 200,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 800,
+            "cache_creation_input_tokens": 100
+        }"#;
+        let parsed: ClaudeUsage = serde_json::from_str(raw).unwrap();
+        let shared = parsed.to_shared();
+        assert_eq!(shared.prompt_tokens, 1100); // 200 + 800 + 100
+        assert_eq!(shared.cached_tokens, 800);
+        assert_eq!(shared.cache_creation_tokens, 100);
+        assert_eq!(shared.completion_tokens, 50);
+    }
+
+    #[test]
+    fn test_claude_usage_deserialize_legacy_no_cache_fields() {
+        // Pre-cache Anthropic response or non-cache-enabled call.
+        let raw = r#"{"input_tokens": 100, "output_tokens": 50}"#;
+        let parsed: ClaudeUsage = serde_json::from_str(raw).unwrap();
+        let shared = parsed.to_shared();
+        assert_eq!(shared.prompt_tokens, 100);
+        assert_eq!(shared.cached_tokens, 0);
+        assert_eq!(shared.cache_creation_tokens, 0);
     }
 
     #[test]
@@ -1042,6 +1176,8 @@ mod tests {
             usage: ClaudeUsage {
                 input_tokens: 20,
                 output_tokens: 30,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
             },
             stop_reason: Some("tool_use".to_string()),
         };
@@ -1072,6 +1208,8 @@ mod tests {
             usage: ClaudeUsage {
                 input_tokens: 10,
                 output_tokens: 10,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
             },
             stop_reason: Some("end_turn".to_string()),
         };

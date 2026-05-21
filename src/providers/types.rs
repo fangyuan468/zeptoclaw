@@ -416,18 +416,51 @@ impl LLMToolCall {
 }
 
 /// Token usage information from a completion request.
+///
+/// `prompt_tokens` is the **total** input tokens (the value the operator
+/// is billed for at the prompt-token rate, **before** any cache discount).
+/// `cached_tokens` and `cache_creation_tokens` are *subsets* / *adjuncts*
+/// for billing-rate refinement, populated only when the upstream provider
+/// reports them. Callers that don't know about cache should treat
+/// `prompt_tokens` as the only input figure.
+///
+/// Provider-specific mapping (PR2):
+/// - **OpenAI / SiliconFlow / DeepSeek (OpenAI-compatible)**: `prompt_tokens`
+///   is the upstream `prompt_tokens` field (which already includes any
+///   cached tokens). `cached_tokens` is the *subset* of those that hit
+///   prefix cache, parsed from `prompt_tokens_details.cached_tokens` when
+///   present (SiliconFlow / DeepSeek expose it; vanilla OpenAI exposes
+///   it on their newer cached-prefix-enabled models).
+///   `cache_creation_tokens` is always 0 — these providers do not bill a
+///   separate cache-write rate.
+/// - **Anthropic Claude**: the upstream `usage.input_tokens` field
+///   represents only the *uncached* portion. To match the OpenAI semantics
+///   above, this provider sums:
+///   `prompt_tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens`,
+///   `cached_tokens = cache_read_input_tokens`,
+///   `cache_creation_tokens = cache_creation_input_tokens`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
-    /// Number of tokens in the prompt
+    /// Total input tokens for this request (includes both `cached_tokens`
+    /// and `cache_creation_tokens` — see struct doc).
     pub prompt_tokens: u32,
-    /// Number of tokens in the completion
+    /// Tokens in the completion.
     pub completion_tokens: u32,
-    /// Total tokens used (prompt + completion)
+    /// Total tokens used (prompt + completion).
     pub total_tokens: u32,
+    /// Subset of `prompt_tokens` that were served from prompt-cache (zero
+    /// when the provider does not report cache stats).
+    #[serde(default)]
+    pub cached_tokens: u32,
+    /// Subset of `prompt_tokens` that were *written* to prompt-cache for
+    /// the first time on this request. Currently populated only by the
+    /// Anthropic provider; OpenAI-compatible providers always emit 0.
+    #[serde(default)]
+    pub cache_creation_tokens: u32,
 }
 
 impl Usage {
-    /// Create new usage information.
+    /// Create new usage information without cache stats.
     ///
     /// # Arguments
     /// * `prompt_tokens` - Tokens in the prompt
@@ -439,12 +472,49 @@ impl Usage {
     ///
     /// let usage = Usage::new(100, 50);
     /// assert_eq!(usage.total_tokens, 150);
+    /// assert_eq!(usage.cached_tokens, 0);
     /// ```
     pub fn new(prompt_tokens: u32, completion_tokens: u32) -> Self {
+        Self::with_cache(prompt_tokens, completion_tokens, 0, 0)
+    }
+
+    /// Create new usage information including cache stats.
+    ///
+    /// `cached_tokens` and `cache_creation_tokens` describe billing-rate
+    /// subdivisions of the same `prompt_tokens` value — they are not
+    /// additional input tokens. See struct doc for the per-provider mapping.
+    ///
+    /// # Example
+    /// ```
+    /// use zeptoclaw::providers::Usage;
+    ///
+    /// let usage = Usage::with_cache(1000, 50, 800, 0);
+    /// assert_eq!(usage.prompt_tokens, 1000);
+    /// assert_eq!(usage.cached_tokens, 800);
+    /// assert_eq!(usage.total_tokens, 1050);
+    /// ```
+    pub fn with_cache(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: u32,
+        cache_creation_tokens: u32,
+    ) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            cached_tokens,
+            cache_creation_tokens,
+        }
+    }
+
+    /// Cache-hit ratio: `cached_tokens / prompt_tokens` in `[0.0, 1.0]`,
+    /// or 0.0 when `prompt_tokens` is 0.
+    pub fn cache_hit_ratio(&self) -> f64 {
+        if self.prompt_tokens == 0 {
+            0.0
+        } else {
+            self.cached_tokens as f64 / self.prompt_tokens as f64
         }
     }
 }
@@ -493,6 +563,68 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.completion_tokens, 50);
         assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn test_usage_new_zero_cache_fields() {
+        let usage = Usage::new(123, 45);
+        assert_eq!(usage.prompt_tokens, 123);
+        assert_eq!(usage.completion_tokens, 45);
+        assert_eq!(usage.total_tokens, 168);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert_eq!(usage.cache_hit_ratio(), 0.0);
+    }
+
+    #[test]
+    fn test_usage_with_cache_full_hit() {
+        let usage = Usage::with_cache(1000, 50, 800, 0);
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 1050);
+        assert_eq!(usage.cached_tokens, 800);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert!((usage.cache_hit_ratio() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_usage_with_cache_creation() {
+        let usage = Usage::with_cache(2000, 100, 0, 1500);
+        assert_eq!(usage.prompt_tokens, 2000);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 1500);
+        assert_eq!(usage.cache_hit_ratio(), 0.0);
+    }
+
+    #[test]
+    fn test_usage_cache_hit_ratio_zero_prompt() {
+        let usage = Usage::with_cache(0, 10, 0, 0);
+        assert_eq!(usage.cache_hit_ratio(), 0.0);
+    }
+
+    #[test]
+    fn test_usage_serde_roundtrip_with_cache() {
+        let usage = Usage::with_cache(1000, 50, 800, 100);
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"cached_tokens\":800"));
+        assert!(json.contains("\"cache_creation_tokens\":100"));
+        let back: Usage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.prompt_tokens, 1000);
+        assert_eq!(back.cached_tokens, 800);
+        assert_eq!(back.cache_creation_tokens, 100);
+    }
+
+    #[test]
+    fn test_usage_deserialize_legacy_payload_defaults_cache_fields() {
+        // Backward compat: old persisted records / external clients that
+        // never knew about the new fields still deserialize correctly.
+        let legacy = r#"{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}"#;
+        let usage: Usage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
     }
 
     #[test]
