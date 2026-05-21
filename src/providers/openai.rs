@@ -217,12 +217,23 @@ struct OpenAIToolCallResponse {
 
 /// OpenAI token usage.
 ///
-/// `prompt_tokens` already includes any cached portion;
-/// `prompt_tokens_details.cached_tokens` is the *subset* served from
-/// prefix cache. SiliconFlow / DeepSeek emit this field on cache-eligible
-/// requests (see SiliconFlow chat-completions API docs); vanilla OpenAI
-/// emits it on cached-prefix-enabled models. When absent we treat
-/// `cached_tokens` as 0.
+/// `prompt_tokens` already includes any cached portion. Two cache-hit
+/// fields exist on this protocol and we accept both:
+///
+/// 1. `prompt_tokens_details.cached_tokens` — newer nested schema.
+///    Vanilla OpenAI emits it on cached-prefix-enabled models;
+///    SiliconFlow / DeepSeek emit it on cache-eligible requests
+///    (DeepSeek schema documents both).
+/// 2. `prompt_cache_hit_tokens` — legacy top-level field on
+///    SiliconFlow / DeepSeek. Some `base_url`-routed deployments may
+///    still emit only this one (per
+///    `docs/plans/doing/2026-05-21-token-cost-optimization.md` §6.2
+///    field-mapping table and §9 risk row "OpenAI 兼容字段不一致").
+///
+/// `cached_tokens()` returns the **max** of the two so that whichever
+/// the upstream populates, the figure surfaces. If both are present
+/// they should be identical; taking max() is also defensive against
+/// upstream serialization bugs.
 #[derive(Debug, Deserialize)]
 struct OpenAIUsage {
     /// Tokens in the prompt (includes cached subset).
@@ -233,6 +244,12 @@ struct OpenAIUsage {
     /// schema; SiliconFlow / DeepSeek expose `cached_tokens` here).
     #[serde(default)]
     prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
+    /// Optional legacy top-level cache-hit field used by some
+    /// SiliconFlow / DeepSeek deployments. Used as a fallback when
+    /// `prompt_tokens_details.cached_tokens` is absent (and as a
+    /// max() with it when both are present).
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
 }
 
 /// Breakdown sub-object inside `usage.prompt_tokens_details`.
@@ -245,12 +262,16 @@ struct OpenAIPromptTokensDetails {
 }
 
 impl OpenAIUsage {
-    /// Pull the cached-token figure out of the optional nested details.
+    /// Resolve the cache-hit count from whichever field(s) the upstream
+    /// populated. See the struct doc for the field-priority rationale.
     fn cached_tokens(&self) -> u32 {
-        self.prompt_tokens_details
+        let hit_nested = self
+            .prompt_tokens_details
             .as_ref()
             .map(|d| d.cached_tokens)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let hit_legacy = self.prompt_cache_hit_tokens.unwrap_or(0);
+        hit_nested.max(hit_legacy)
     }
 }
 
@@ -1365,6 +1386,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 prompt_tokens_details: None,
+                prompt_cache_hit_tokens: None,
             }),
         };
         let converted = convert_response(response);
@@ -1396,6 +1418,7 @@ mod tests {
                 prompt_tokens: 1000,
                 completion_tokens: 50,
                 prompt_tokens_details: Some(OpenAIPromptTokensDetails { cached_tokens: 800 }),
+                prompt_cache_hit_tokens: None,
             }),
         };
         let converted = convert_response(response);
@@ -1437,6 +1460,85 @@ mod tests {
         let raw = r#"{"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {}}"#;
         let parsed: OpenAIUsage = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.cached_tokens(), 0);
+    }
+
+    #[test]
+    fn test_openai_usage_deserialize_legacy_hit_only() {
+        // SiliconFlow / DeepSeek deployment that emits ONLY the legacy
+        // top-level prompt_cache_hit_tokens (no nested details object).
+        // Must surface the value, not silently report 0.
+        let raw = r#"{
+            "prompt_tokens": 1234,
+            "completion_tokens": 56,
+            "prompt_cache_hit_tokens": 1024
+        }"#;
+        let parsed: OpenAIUsage = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.cached_tokens(), 1024);
+    }
+
+    #[test]
+    fn test_openai_usage_deserialize_both_fields_consistent_take_max() {
+        // SiliconFlow / DeepSeek schema documents both fields. When both
+        // are present and equal, max() collapses to that value (sanity).
+        let raw = r#"{
+            "prompt_tokens": 2000,
+            "completion_tokens": 80,
+            "prompt_tokens_details": {"cached_tokens": 1500},
+            "prompt_cache_hit_tokens": 1500
+        }"#;
+        let parsed: OpenAIUsage = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.cached_tokens(), 1500);
+    }
+
+    #[test]
+    fn test_openai_usage_deserialize_both_fields_disagree_take_max() {
+        // Defensive: if upstream serialization disagrees between the
+        // nested and legacy fields, prefer the larger value so we never
+        // under-report cache savings (and never panic on disagreement).
+        let raw = r#"{
+            "prompt_tokens": 2000,
+            "completion_tokens": 80,
+            "prompt_tokens_details": {"cached_tokens": 1200},
+            "prompt_cache_hit_tokens": 1500
+        }"#;
+        let parsed: OpenAIUsage = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.cached_tokens(), 1500);
+
+        // Reverse ordering: nested > legacy.
+        let raw2 = r#"{
+            "prompt_tokens": 2000,
+            "completion_tokens": 80,
+            "prompt_tokens_details": {"cached_tokens": 1500},
+            "prompt_cache_hit_tokens": 800
+        }"#;
+        let parsed2: OpenAIUsage = serde_json::from_str(raw2).unwrap();
+        assert_eq!(parsed2.cached_tokens(), 1500);
+    }
+
+    #[test]
+    fn test_convert_response_with_legacy_only_cache_field() {
+        // End-to-end: a response that only carries the legacy field
+        // must still produce a Usage with the correct cached_tokens
+        // (not silent 0) when fed through convert_response().
+        let response = OpenAIResponse {
+            choices: vec![OpenAIChoice {
+                message: OpenAIResponseMessage {
+                    content: Some("ok".to_string()),
+                    tool_calls: None,
+                },
+            }],
+            usage: Some(OpenAIUsage {
+                prompt_tokens: 1500,
+                completion_tokens: 40,
+                prompt_tokens_details: None,
+                prompt_cache_hit_tokens: Some(1200),
+            }),
+        };
+        let usage = convert_response(response).usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 1500);
+        assert_eq!(usage.cached_tokens, 1200);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert!((usage.cache_hit_ratio() - 0.8).abs() < 1e-9);
     }
 
     #[test]
@@ -1667,6 +1769,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 prompt_tokens_details: None,
+                prompt_cache_hit_tokens: None,
             }),
         };
 
@@ -1701,6 +1804,7 @@ mod tests {
                 prompt_tokens_details: Some(OpenAIPromptTokensDetails {
                     cached_tokens: 1500,
                 }),
+                prompt_cache_hit_tokens: None,
             }),
         };
 
