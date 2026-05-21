@@ -107,9 +107,15 @@ pub struct RuntimeContext {
     pub channel: Option<String>,
     /// Names of available tools
     pub available_tools: Vec<String>,
-    /// Timezone label (e.g., "Asia/Kuala_Lumpur"). When set, current time is
-    /// computed **live** in `render()` via `chrono::Local` so it is never stale.
-    /// The label is displayed in the system prompt for the LLM's awareness.
+    /// Timezone label (e.g., "Asia/Kuala_Lumpur"). When set, `render()` emits a
+    /// **day-granular** `Today is: ...` line in the system prompt (computed live
+    /// via `chrono::Local`).
+    ///
+    /// Minute-level time and timezone offset are intentionally **not** emitted:
+    /// they would change every minute and invalidate the prompt-cache prefix on
+    /// every call. Channel UIs (Telegram/Discord/CLI/WhatsApp) already display
+    /// message timestamps to the user; the model retains day-of-week awareness
+    /// via the `Today is:` label.
     pub timezone: Option<String>,
     /// Workspace path
     pub workspace: Option<String>,
@@ -156,11 +162,15 @@ impl RuntimeContext {
         self
     }
 
-    /// Set the timezone label and enable time display in the system prompt.
+    /// Set the timezone label and enable the day-granular `Today is:` line in
+    /// the system prompt.
     ///
-    /// When a timezone is set, `render()` computes the current local time
-    /// dynamically via `chrono::Local` so it is always fresh. The timezone
-    /// string is shown as an informational label for the LLM.
+    /// When a timezone is set, `render()` emits `- Today is: <Day>, <Month> <D>, <YYYY>`
+    /// computed live via `chrono::Local`. Minute-level time and timezone offset
+    /// are intentionally **not** emitted to keep the prompt-cache prefix stable
+    /// (changing every minute would invalidate every cached prefix). The `tz`
+    /// label itself is currently used only as an "enable" flag; the rendered
+    /// date follows the host's local timezone.
     ///
     /// # Arguments
     /// * `tz` - Timezone label (e.g., "Asia/Kuala_Lumpur", "US/Pacific", "UTC")
@@ -235,17 +245,14 @@ impl RuntimeContext {
                 self.available_tools.join(", ")
             ));
         }
-        // Compute current time LIVE via chrono::Local (never stale).
-        // The timezone label comes from config (auto-detected IANA name),
-        // but we always show the actual system offset to avoid contradictions.
+        // P0a: emit only the day-granular `Today is:` label. Minute-level
+        // time and timezone offset are intentionally NOT emitted — they
+        // would change every minute and invalidate the prompt-cache prefix
+        // on every LLM call. Channel UIs already show message timestamps;
+        // the model still has day-of-week awareness via this label.
         if self.timezone.is_some() {
             let now = Local::now();
-            parts.push(format!(
-                "- Current time: {}",
-                now.format("%A, %Y-%m-%d %H:%M %:z")
-            ));
             parts.push(format!("- Today is: {}", now.format("%A, %B %-d, %Y")));
-            parts.push(format!("- Timezone: {}", now.format("%:z")));
         }
         if let Some(ref workspace) = self.workspace {
             parts.push(format!("- Workspace: {}", workspace));
@@ -877,12 +884,22 @@ mod tests {
         let ctx = RuntimeContext::new().with_timezone("Asia/Kuala_Lumpur");
         assert!(!ctx.is_empty());
         let rendered = ctx.render().unwrap();
-        assert!(rendered.contains("Current time:"));
-        // Timezone label now shows the actual system UTC offset (e.g. "+08:00")
-        // instead of the config IANA name, to avoid contradictions.
+        // P0a: only the day-granular `Today is:` label is emitted; minute-level
+        // `Current time:` and `Timezone:` lines were removed to keep the system
+        // prompt prefix stable for prompt-cache hits.
         assert!(
-            rendered.contains("Timezone: +") || rendered.contains("Timezone: -"),
-            "should show UTC offset: {}",
+            rendered.contains("Today is:"),
+            "should emit day-granular label: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("Current time:"),
+            "must NOT emit minute-level Current time line (cache-killer): {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("Timezone:"),
+            "must NOT emit Timezone offset line (cache-killer): {}",
             rendered
         );
     }
@@ -891,40 +908,105 @@ mod tests {
     fn test_runtime_context_with_utc_label() {
         let ctx = RuntimeContext::new().with_timezone("UTC");
         let rendered = ctx.render().unwrap();
-        assert!(rendered.contains("Current time:"));
-        // Even when config says "UTC", the displayed timezone is the actual
-        // system offset from chrono::Local (e.g. "+08:00" or "+00:00").
+        // P0a: regardless of timezone label, render() must produce only the
+        // day-granular line and no minute-level / offset content.
+        assert!(rendered.contains("Today is:"));
+        assert!(!rendered.contains("Current time:"));
+        assert!(!rendered.contains("Timezone:"));
+    }
+
+    #[test]
+    fn test_runtime_context_time_format() {
+        // Verify render produces the expected day-granular format: "Today is: <Day>, <Month> <D>, <YYYY>"
+        let ctx = RuntimeContext::new().with_timezone("UTC");
+        let rendered = ctx.render().unwrap();
+        let today_line = rendered
+            .lines()
+            .find(|l| l.contains("Today is:"))
+            .expect("render should emit a Today is: line when timezone is set");
+        // Should contain a 4-digit year (no minute-level info anywhere on the line).
         assert!(
-            rendered.contains("Timezone: +") || rendered.contains("Timezone: -"),
-            "should show UTC offset: {}",
+            today_line.contains("202"),
+            "today line should contain year: {}",
+            today_line
+        );
+    }
+
+    #[test]
+    fn test_runtime_context_today_label_present() {
+        // Renamed from test_runtime_context_time_is_live (P0a):
+        // we no longer expose minute-level "Current time", so the live-ness
+        // we care about is the day-granular Today is: label and the absence
+        // of minute / timezone-offset content.
+        let ctx = RuntimeContext::new().with_timezone("local");
+        let rendered = ctx.render().unwrap();
+        assert!(
+            rendered.contains("Today is:"),
+            "should emit Today is: label: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("Current time:"),
+            "must NOT emit Current time: (cache-killer): {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("Timezone:"),
+            "must NOT emit Timezone: (cache-killer): {}",
             rendered
         );
     }
 
     #[test]
-    fn test_runtime_context_time_format() {
-        // Verify render produces expected format: "Day YYYY-MM-DD HH:MM +HH:MM"
-        let ctx = RuntimeContext::new().with_timezone("UTC");
+    fn test_runtime_context_cache_friendly_render() {
+        // Hard guarantee for prompt-cache prefix stability: render() output
+        // must NOT contain any minute-level time substring or timezone offset.
+        // This is the structural cause of cache stability — we assert the cause,
+        // not the effect (e.g. no `sleep` based equality test, which would
+        // flake on CI and time out on slow runners).
+        let ctx = RuntimeContext::new()
+            .with_channel("cli")
+            .with_timezone("Asia/Kuala_Lumpur")
+            .with_workspace("/tmp/ws")
+            .with_os_info();
         let rendered = ctx.render().unwrap();
-        // Extract the time line
-        let time_line = rendered
-            .lines()
-            .find(|l| l.contains("Current time:"))
-            .unwrap();
-        // Should contain a 4-digit year
-        assert!(
-            time_line.contains("202"),
-            "time should contain year: {}",
-            time_line
-        );
-    }
 
-    #[test]
-    fn test_runtime_context_time_is_live() {
-        // Verify render works — time is computed dynamically each call
-        let ctx = RuntimeContext::new().with_timezone("local");
-        let r1 = ctx.render().unwrap();
-        assert!(r1.contains("Current time:"));
+        // 1) No "HH:MM" minute marker anywhere in the rendered text.
+        let has_minute_marker = rendered.as_bytes().windows(5).any(|w| {
+            w.len() == 5
+                && w[0].is_ascii_digit()
+                && w[1].is_ascii_digit()
+                && w[2] == b':'
+                && w[3].is_ascii_digit()
+                && w[4].is_ascii_digit()
+        });
+        assert!(
+            !has_minute_marker,
+            "render() must not contain HH:MM minute markers: {}",
+            rendered
+        );
+
+        // 2) No timezone offset pattern "[+-]HH:MM" anywhere.
+        let has_offset_pattern = rendered.as_bytes().windows(6).any(|w| {
+            (w[0] == b'+' || w[0] == b'-')
+                && w[1].is_ascii_digit()
+                && w[2].is_ascii_digit()
+                && w[3] == b':'
+                && w[4].is_ascii_digit()
+                && w[5].is_ascii_digit()
+        });
+        assert!(
+            !has_offset_pattern,
+            "render() must not contain timezone offset like +HH:MM: {}",
+            rendered
+        );
+
+        // 3) Sanity: the day-granular label is still present.
+        assert!(
+            rendered.contains("Today is:"),
+            "render() should still emit Today is: label: {}",
+            rendered
+        );
     }
 
     #[test]
