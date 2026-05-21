@@ -60,9 +60,6 @@
 pub mod android;
 pub mod approval;
 pub mod approval_broker;
-pub mod hard_floor;
-pub mod thread_approval;
-pub mod thread_identity;
 pub mod binary_plugin;
 pub mod browser;
 pub mod clarification;
@@ -79,6 +76,7 @@ pub mod git;
 pub mod google;
 pub mod grep;
 pub mod gsheets;
+pub mod hard_floor;
 pub mod hardware;
 pub mod http_request;
 pub mod longterm_memory;
@@ -101,6 +99,8 @@ pub mod spawn;
 pub mod stripe;
 #[cfg(feature = "panel")]
 pub mod task;
+pub mod thread_approval;
+pub mod thread_identity;
 pub mod transcribe;
 mod types;
 pub mod web;

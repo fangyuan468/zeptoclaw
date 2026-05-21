@@ -388,14 +388,8 @@ pub(crate) async fn cmd_gateway(
             // processing so the user's actual message still gets a
             // chance to be parsed as a command or routed to the
             // agent).
-            let confirm_result = handle_pending_confirm(
-                &pending,
-                &thread,
-                trimmed,
-                msg,
-                &bus_for_replies,
-                &store,
-            );
+            let confirm_result =
+                handle_pending_confirm(&pending, &thread, trimmed, msg, &bus_for_replies, &store);
             if matches!(confirm_result, ConfirmOutcome::Consumed) {
                 return true;
             }
@@ -1170,11 +1164,19 @@ async fn register_approval_handler(
             async move {
                 let chat_id = match request.chat_id.as_deref() {
                     Some(id) if !id.is_empty() => id.to_string(),
-                    _ => return ApprovalResponse::Denied("No chat routing context for approval".into()),
+                    _ => {
+                        return ApprovalResponse::Denied(
+                            "No chat routing context for approval".into(),
+                        )
+                    }
                 };
                 let channel = match request.channel.as_deref() {
                     Some(ch) if !ch.is_empty() => ch.to_string(),
-                    _ => return ApprovalResponse::Denied("No channel routing context for approval".into()),
+                    _ => {
+                        return ApprovalResponse::Denied(
+                            "No channel routing context for approval".into(),
+                        )
+                    }
                 };
 
                 // Prefer the request-supplied `(user_id, agent_id)` (the
@@ -1184,9 +1186,7 @@ async fn register_approval_handler(
                 // future caller override). Fall back to the process
                 // identity, then to chat_id-keyed buckets.
                 let thread = match (request.user_id.as_deref(), request.agent_id.as_deref()) {
-                    (Some(u), Some(a)) if !u.is_empty() && !a.is_empty() => {
-                        ThreadKey::new(u, a)
-                    }
+                    (Some(u), Some(a)) if !u.is_empty() && !a.is_empty() => ThreadKey::new(u, a),
                     _ => identity.resolve_key(&chat_id),
                 };
 
@@ -1248,7 +1248,10 @@ async fn register_approval_handler(
                 // action attached to it.
                 let card_pending_total: usize = 1;
                 let queue_hint = if pending > 1 {
-                    format!("\n({} more approval(s) queued — each will be asked separately)", pending)
+                    format!(
+                        "\n({} more approval(s) queued — each will be asked separately)",
+                        pending
+                    )
                 } else {
                     String::new()
                 };
@@ -1282,11 +1285,7 @@ async fn register_approval_handler(
 
                 let prompt = format!(
                     "**[Approval Required]** — `{}`\n{}{}\nReply **yes** / **no**.{}{}",
-                    request.tool_name,
-                    args_display,
-                    hard_floor_badge,
-                    queue_hint,
-                    mode_hint,
+                    request.tool_name, args_display, hard_floor_badge, queue_hint, mode_hint,
                 );
                 if is_acp_channel(&channel) {
                     let mut payload = serde_json::json!({
@@ -1346,10 +1345,10 @@ async fn register_approval_handler(
 
                 let outcome =
                     match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
-                    Ok(Ok(true)) => ApprovalResponse::Approved,
-                    Ok(Ok(false)) => ApprovalResponse::Denied("User denied".into()),
-                    _ => ApprovalResponse::TimedOut,
-                };
+                        Ok(Ok(true)) => ApprovalResponse::Approved,
+                        Ok(Ok(false)) => ApprovalResponse::Denied("User denied".into()),
+                        _ => ApprovalResponse::TimedOut,
+                    };
 
                 let decision_label = match &outcome {
                     ApprovalResponse::Approved => "approved",
@@ -1702,11 +1701,19 @@ mod tests {
     async fn handler_bypass_isolated_per_thread() {
         let (store, _tmp) = fresh_store();
         store
-            .set(&thread("alice", "zc"), ThreadApprovalMode::AutoApprove, "cli")
+            .set(
+                &thread("alice", "zc"),
+                ThreadApprovalMode::AutoApprove,
+                "cli",
+            )
             .unwrap();
         assert!(would_auto_approve(&store, &thread("alice", "zc"), false));
         // Different agent for same user → still RequireApproval.
-        assert!(!would_auto_approve(&store, &thread("alice", "claude"), false));
+        assert!(!would_auto_approve(
+            &store,
+            &thread("alice", "claude"),
+            false
+        ));
         // Different user → unaffected.
         assert!(!would_auto_approve(&store, &thread("bob", "zc"), false));
     }

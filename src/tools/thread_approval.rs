@@ -170,10 +170,7 @@ impl ThreadApprovalStore {
             updated_at: Utc::now(),
             updated_by: source.to_string(),
         };
-        let mut guard = self
-            .states
-            .write()
-            .expect("ThreadApprovalStore poisoned");
+        let mut guard = self.states.write().expect("ThreadApprovalStore poisoned");
         guard.insert(thread.clone(), state.clone());
         if !self.root.as_os_str().is_empty() {
             save_to_disk(&self.root, &guard)?;
@@ -403,9 +400,7 @@ mod tests {
         store
             .set(&key("alice", "zc"), ThreadApprovalMode::AutoApprove, "cli")
             .unwrap();
-        let tmp_path = tmp
-            .path()
-            .join(format!("{}.tmp", APPROVAL_THREAD_FILENAME));
+        let tmp_path = tmp.path().join(format!("{}.tmp", APPROVAL_THREAD_FILENAME));
         assert!(
             !tmp_path.exists(),
             "rename should remove the temp file ({})",

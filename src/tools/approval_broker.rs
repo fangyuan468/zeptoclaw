@@ -142,10 +142,7 @@ impl ApprovalBroker {
     /// "not handled" and let the message continue downstream rather than
     /// silently resolving an unrelated request.
     pub fn resolve_by_id(&self, thread: &ThreadKey, request_id: &str, approved: bool) -> bool {
-        let mut guard = self
-            .pending
-            .lock()
-            .expect("ApprovalBroker mutex poisoned");
+        let mut guard = self.pending.lock().expect("ApprovalBroker mutex poisoned");
         let Some(queue) = guard.get_mut(thread) else {
             return false;
         };
@@ -169,10 +166,7 @@ impl ApprovalBroker {
     ///
     /// Returns `true` if a pending entry was found and resolved.
     pub fn resolve_fifo(&self, thread: &ThreadKey, approved: bool) -> bool {
-        let mut guard = self
-            .pending
-            .lock()
-            .expect("ApprovalBroker mutex poisoned");
+        let mut guard = self.pending.lock().expect("ApprovalBroker mutex poisoned");
         let Some(queue) = guard.get_mut(thread) else {
             return false;
         };
@@ -195,10 +189,7 @@ impl ApprovalBroker {
     /// entries remain pending in the queue for `resolve_by_id` / next
     /// `resolve_fifo`.
     pub fn resolve_all(&self, thread: &ThreadKey, approved: bool) -> usize {
-        let mut guard = self
-            .pending
-            .lock()
-            .expect("ApprovalBroker mutex poisoned");
+        let mut guard = self.pending.lock().expect("ApprovalBroker mutex poisoned");
         let Some(queue) = guard.get_mut(thread) else {
             return 0;
         };
@@ -249,10 +240,7 @@ impl ApprovalBroker {
     /// they've been removed from the map.
     pub fn sweep_expired(&self, max_age: Duration) -> usize {
         let now = Instant::now();
-        let mut guard = self
-            .pending
-            .lock()
-            .expect("ApprovalBroker mutex poisoned");
+        let mut guard = self.pending.lock().expect("ApprovalBroker mutex poisoned");
         let mut swept = 0usize;
         guard.retain(|_thread, queue| {
             queue.retain(|entry| {
@@ -380,10 +368,7 @@ mod tests {
         let key = tk("alice", "zc");
         let mut rx_hard = broker.register(&key, "req_hard", true);
         assert_eq!(broker.resolve_all(&key, true), 0);
-        assert_eq!(
-            rx_hard.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        );
+        assert_eq!(rx_hard.try_recv(), Err(oneshot::error::TryRecvError::Empty));
         assert!(broker.has_pending(&key));
     }
 
@@ -396,7 +381,10 @@ mod tests {
         let _rx_normal = broker.register(&key, "req_normal", false);
         let _rx_hard = broker.register(&key, "req_hard", true);
         broker.resolve_all(&key, false);
-        assert!(broker.has_pending(&key), "HardFloor survivor must stay in the map");
+        assert!(
+            broker.has_pending(&key),
+            "HardFloor survivor must stay in the map"
+        );
     }
 
     #[test]

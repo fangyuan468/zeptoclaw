@@ -830,8 +830,7 @@ impl AcpHttpChannel {
         // ~5–10s into the wait, even though the agent is healthily
         // blocked on `oneshot::recv()`. SSE comment lines (`: …\n\n`)
         // are silently skipped by any conforming SSE consumer.
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_secs(PROMPT_TIMEOUT_SECS);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(PROMPT_TIMEOUT_SECS);
         let heartbeat = Duration::from_secs(SSE_HEARTBEAT_SECS);
         loop {
             let frag = tokio::select! {

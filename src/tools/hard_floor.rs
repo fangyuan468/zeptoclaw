@@ -61,10 +61,8 @@ macro_rules! rule {
             id: $id,
             reason: $reason,
             pattern: Lazy::new(|| {
-                Regex::new($pattern).expect(concat!(
-                    "hard_floor rule pattern failed to compile: ",
-                    $id
-                ))
+                Regex::new($pattern)
+                    .expect(concat!("hard_floor rule pattern failed to compile: ", $id))
             }),
         }
     };
@@ -225,13 +223,9 @@ mod tests {
     fn check_returns_none_for_shell_without_command_arg() {
         let m = matcher();
         assert!(m.check("shell", &json!({})).is_none());
-        assert!(m
-            .check("shell", &json!({"timeout": 60}))
-            .is_none());
+        assert!(m.check("shell", &json!({"timeout": 60})).is_none());
         // Non-string command.
-        assert!(m
-            .check("shell", &json!({"command": 42}))
-            .is_none());
+        assert!(m.check("shell", &json!({"command": 42})).is_none());
     }
 
     // ---- rule_count smoke test -----------------------------------------
@@ -298,7 +292,10 @@ mod tests {
         let m = matcher();
         assert_eq!(check_shell(&m, "mkfs /dev/sdb1"), Some("mkfs_any"));
         assert_eq!(check_shell(&m, "mkfs.ext4 /dev/sdb1"), Some("mkfs_any"));
-        assert_eq!(check_shell(&m, "sudo mkfs.xfs /dev/nvme0n1p1"), Some("mkfs_any"));
+        assert_eq!(
+            check_shell(&m, "sudo mkfs.xfs /dev/nvme0n1p1"),
+            Some("mkfs_any")
+        );
     }
 
     #[test]
@@ -335,7 +332,10 @@ mod tests {
     fn dd_to_block_device_negative() {
         let m = matcher();
         // Output to a regular file is fine.
-        assert_eq!(check_shell(&m, "dd if=/dev/zero of=./hello.bin bs=1k count=1"), None);
+        assert_eq!(
+            check_shell(&m, "dd if=/dev/zero of=./hello.bin bs=1k count=1"),
+            None
+        );
         // No `of=` arg at all (dd reading to stdout).
         assert_eq!(check_shell(&m, "dd if=/dev/urandom bs=64 count=1"), None);
         // /dev/null is not a block device.
@@ -407,11 +407,20 @@ mod tests {
     #[test]
     fn chmod_777_root_recursive_positive() {
         let m = matcher();
-        assert_eq!(check_shell(&m, "chmod -R 777 /"), Some("chmod_777_root_recursive"));
-        assert_eq!(check_shell(&m, "sudo chmod -R 777 /"), Some("chmod_777_root_recursive"));
+        assert_eq!(
+            check_shell(&m, "chmod -R 777 /"),
+            Some("chmod_777_root_recursive")
+        );
+        assert_eq!(
+            check_shell(&m, "sudo chmod -R 777 /"),
+            Some("chmod_777_root_recursive")
+        );
         // Non-recursive form: `chmod 777 /` is still catastrophic
         // (changes / itself but not children) — we treat it the same.
-        assert_eq!(check_shell(&m, "chmod 777 /"), Some("chmod_777_root_recursive"));
+        assert_eq!(
+            check_shell(&m, "chmod 777 /"),
+            Some("chmod_777_root_recursive")
+        );
     }
 
     #[test]
@@ -430,7 +439,10 @@ mod tests {
     #[test]
     fn shutdown_or_reboot_positive() {
         let m = matcher();
-        assert_eq!(check_shell(&m, "shutdown -h now"), Some("shutdown_or_reboot"));
+        assert_eq!(
+            check_shell(&m, "shutdown -h now"),
+            Some("shutdown_or_reboot")
+        );
         assert_eq!(check_shell(&m, "sudo reboot"), Some("shutdown_or_reboot"));
         assert_eq!(check_shell(&m, "init 0"), Some("shutdown_or_reboot"));
     }
