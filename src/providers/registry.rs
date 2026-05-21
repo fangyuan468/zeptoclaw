@@ -233,6 +233,16 @@ pub const PROVIDER_REGISTRY: &[ProviderSpec] = &[
         default_api_version: None,
         api_key_required: true,
     },
+    ProviderSpec {
+        name: "siliconflow",
+        model_keywords: &["siliconflow"],
+        runtime_supported: true,
+        default_base_url: Some("https://api.siliconflow.cn/v1"),
+        backend: "openai",
+        default_auth_header: None,
+        default_api_version: None,
+        api_key_required: true,
+    },
 ];
 
 pub fn provider_config_by_name<'a>(config: &'a Config, name: &str) -> Option<&'a ProviderConfig> {
@@ -255,6 +265,7 @@ pub fn provider_config_by_name<'a>(config: &'a Config, name: &str) -> Option<&'a
         "qianfan" => config.providers.qianfan.as_ref(),
         "novita" => config.providers.novita.as_ref(),
         "liquid" => config.providers.liquid.as_ref(),
+        "siliconflow" => config.providers.siliconflow.as_ref(),
         _ => None,
     }
 }

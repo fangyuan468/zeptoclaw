@@ -1579,6 +1579,9 @@ pub struct ProvidersConfig {
     /// Liquid AI configuration (OpenAI-compatible, LFM2 model family — edge-optimized).
     #[serde(default)]
     pub liquid: Option<ProviderConfig>,
+    /// SiliconFlow configuration (OpenAI-compatible, hosts GLM / DeepSeek / Qwen etc.).
+    #[serde(default)]
+    pub siliconflow: Option<ProviderConfig>,
     /// Retry behavior for runtime provider calls
     pub retry: RetryConfig,
     /// Fallback behavior across multiple configured runtime providers

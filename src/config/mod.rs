@@ -692,6 +692,22 @@ impl Config {
                 .api_base = Some(val);
         }
 
+        // SiliconFlow
+        if let Ok(val) = std::env::var("ZEPTOCLAW_PROVIDERS_SILICONFLOW_API_KEY")
+            .or_else(|_| std::env::var("SILICONFLOW_API_KEY"))
+        {
+            self.providers
+                .siliconflow
+                .get_or_insert_with(ProviderConfig::default)
+                .api_key = Some(val);
+        }
+        if let Ok(val) = std::env::var("ZEPTOCLAW_PROVIDERS_SILICONFLOW_API_BASE") {
+            self.providers
+                .siliconflow
+                .get_or_insert_with(ProviderConfig::default)
+                .api_base = Some(val);
+        }
+
         // Per-provider model overrides
         if let Ok(val) = std::env::var("ZEPTOCLAW_PROVIDERS_ANTHROPIC_MODEL") {
             self.providers
@@ -786,6 +802,12 @@ impl Config {
         if let Ok(val) = std::env::var("ZEPTOCLAW_PROVIDERS_LIQUID_MODEL") {
             self.providers
                 .liquid
+                .get_or_insert_with(ProviderConfig::default)
+                .model = Some(val);
+        }
+        if let Ok(val) = std::env::var("ZEPTOCLAW_PROVIDERS_SILICONFLOW_MODEL") {
+            self.providers
+                .siliconflow
                 .get_or_insert_with(ProviderConfig::default)
                 .model = Some(val);
         }
