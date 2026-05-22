@@ -14,6 +14,15 @@ use crate::error::Result;
 use crate::providers::ChatOptions;
 use crate::session::Role;
 
+const LAZY_TOOL_SCHEMA_SYSTEM_HINT: &str = r#"## Lazy Tool Schema Usage
+
+When tool schemas are lazy-loaded, use these common tools directly when their arguments are obvious:
+- internal__web_search: {"query": "...", "count": 10}
+- internal__web_fetch: {"url": "https://..."}
+- internal__shell: {"command": "..."}
+
+Before using a tool for the first time when you are not certain about its exact argument names or types, call internal__get_tool_schema with the tool's exposed name. If a tool returns Invalid args, call internal__get_tool_schema immediately and retry with the schema."#;
+
 /// Builds the resolved messages, tool definitions, and chat options.
 ///
 /// Requires `ctx.session` to be populated (runs after session + compaction).
@@ -63,6 +72,10 @@ impl Middleware for ContextBuildMiddleware {
             // Filter out empty user messages (e.g. after failed image resolution).
             msgs.retain(|m| !(m.role == Role::User && m.content.is_empty() && !m.has_images()));
 
+            if ctx.config.agents.defaults.lazy_tool_schema {
+                append_lazy_tool_schema_hint(&mut msgs);
+            }
+
             ctx.messages = Some(msgs);
         }
 
@@ -83,6 +96,13 @@ impl Middleware for ContextBuildMiddleware {
         ctx.chat_options = Some(options);
 
         next.run(ctx).await
+    }
+}
+
+fn append_lazy_tool_schema_hint(messages: &mut [crate::session::Message]) {
+    if let Some(system) = messages.iter_mut().find(|m| m.role == Role::System) {
+        system.content.push_str("\n\n");
+        system.content.push_str(LAZY_TOOL_SCHEMA_SYSTEM_HINT);
     }
 }
 
@@ -198,5 +218,31 @@ mod tests {
             "System prompt should include memory override, got: {}",
             &system_content[..system_content.len().min(200)]
         );
+    }
+
+    #[tokio::test]
+    async fn lazy_tool_schema_hint_included_when_enabled() {
+        let mw = ContextBuildMiddleware::new();
+        let terminal = MockTerminal::with_response("ok");
+        let pipeline = crate::agent::pipeline::Pipeline::builder()
+            .add(mw)
+            .build(terminal);
+
+        let subsystems = test_subsystems();
+        let mut ctx = test_context(subsystems);
+        let mut config = crate::config::Config::default();
+        config.agents.defaults.lazy_tool_schema = true;
+        ctx.config = std::sync::Arc::new(config);
+        let mut session = Session::new("test");
+        session.add_message(Message::user("Search something"));
+        ctx.session = Some(session);
+
+        let _ = pipeline.execute(&mut ctx).await.unwrap();
+
+        let messages = ctx.messages.as_ref().expect("messages should be set");
+        let system_content = &messages[0].content;
+        assert!(system_content.contains("Lazy Tool Schema Usage"));
+        assert!(system_content.contains("internal__get_tool_schema"));
+        assert!(system_content.contains("internal__web_search"));
     }
 }
