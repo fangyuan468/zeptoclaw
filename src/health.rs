@@ -331,10 +331,12 @@ impl HealthRegistry {
             let tool_calls = m.tool_calls.load(Ordering::Relaxed);
             let input_tokens = m.input_tokens.load(Ordering::Relaxed);
             let output_tokens = m.output_tokens.load(Ordering::Relaxed);
+            let schema_retrievals = m.tool_schema_retrieval_count.load(Ordering::Relaxed);
+            let validation_failures = m.tool_validation_failure_count.load(Ordering::Relaxed);
             let errors = m.errors.load(Ordering::Relaxed);
             json.push_str(&format!(
-                ",\"usage\":{{\"requests\":{},\"tool_calls\":{},\"input_tokens\":{},\"output_tokens\":{},\"errors\":{}}}",
-                requests, tool_calls, input_tokens, output_tokens, errors
+                ",\"usage\":{{\"requests\":{},\"tool_calls\":{},\"input_tokens\":{},\"output_tokens\":{},\"tool_schema_retrieval_count\":{},\"tool_validation_failure_count\":{},\"errors\":{}}}",
+                requests, tool_calls, input_tokens, output_tokens, schema_retrievals, validation_failures, errors
             ));
         }
 
@@ -370,6 +372,10 @@ pub struct UsageMetrics {
     pub cached_tokens: AtomicU64,
     /// Cumulative cache-creation input tokens (Anthropic prompt-cache write).
     pub cache_creation_tokens: AtomicU64,
+    /// Number of lazy schema retrieval tool calls.
+    pub tool_schema_retrieval_count: AtomicU64,
+    /// Number of lazy tool argument validation failures.
+    pub tool_validation_failure_count: AtomicU64,
     /// Total errors encountered.
     pub errors: AtomicU64,
     /// Whether the gateway is ready to accept requests.
@@ -386,6 +392,8 @@ impl UsageMetrics {
             output_tokens: AtomicU64::new(0),
             cached_tokens: AtomicU64::new(0),
             cache_creation_tokens: AtomicU64::new(0),
+            tool_schema_retrieval_count: AtomicU64::new(0),
+            tool_validation_failure_count: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             ready: AtomicBool::new(false),
         }
@@ -399,6 +407,18 @@ impl UsageMetrics {
     /// Increment the tool call counter.
     pub fn record_tool_calls(&self, count: u64) {
         self.tool_calls.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Increment lazy schema retrieval count.
+    pub fn record_tool_schema_retrieval(&self) {
+        self.tool_schema_retrieval_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment lazy validation failure count.
+    pub fn record_tool_validation_failure(&self) {
+        self.tool_validation_failure_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record token usage from an LLM response (no cache breakdown).
@@ -468,6 +488,9 @@ impl UsageMetrics {
             cached_tokens = cached_tokens,
             cache_creation_tokens = cache_creation_tokens,
             cache_hit_ratio = cache_hit_ratio,
+            tool_schema_retrieval_count = self.tool_schema_retrieval_count.load(Ordering::Relaxed),
+            tool_validation_failure_count =
+                self.tool_validation_failure_count.load(Ordering::Relaxed),
             errors = self.errors.load(Ordering::Relaxed),
             "Usage metrics"
         );
@@ -623,11 +646,13 @@ pub async fn start_health_server_legacy(
                                     ));
                                 }
                                 parts.push(format!(
-                                    "\"usage\":{{\"requests\":{},\"tool_calls\":{},\"input_tokens\":{},\"output_tokens\":{},\"errors\":{}}}",
+                                    "\"usage\":{{\"requests\":{},\"tool_calls\":{},\"input_tokens\":{},\"output_tokens\":{},\"tool_schema_retrieval_count\":{},\"tool_validation_failure_count\":{},\"errors\":{}}}",
                                     metrics.requests.load(Ordering::Relaxed),
                                     metrics.tool_calls.load(Ordering::Relaxed),
                                     metrics.input_tokens.load(Ordering::Relaxed),
                                     metrics.output_tokens.load(Ordering::Relaxed),
+                                    metrics.tool_schema_retrieval_count.load(Ordering::Relaxed),
+                                    metrics.tool_validation_failure_count.load(Ordering::Relaxed),
                                     metrics.errors.load(Ordering::Relaxed),
                                 ));
                                 ("200 OK", format!("{{{}}}", parts.join(",")))
@@ -856,6 +881,16 @@ mod tests {
         let metrics = UsageMetrics::new();
         assert_eq!(metrics.requests.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.tool_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.tool_schema_retrieval_count.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .tool_validation_failure_count
+                .load(Ordering::Relaxed),
+            0
+        );
         assert!(!metrics.ready.load(Ordering::SeqCst));
     }
 
@@ -865,11 +900,23 @@ mod tests {
         metrics.record_request();
         metrics.record_request();
         metrics.record_tool_calls(3);
+        metrics.record_tool_schema_retrieval();
+        metrics.record_tool_validation_failure();
         metrics.record_tokens(100, 50);
         metrics.record_error();
 
         assert_eq!(metrics.requests.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.tool_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            metrics.tool_schema_retrieval_count.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .tool_validation_failure_count
+                .load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(metrics.input_tokens.load(Ordering::Relaxed), 100);
         assert_eq!(metrics.output_tokens.load(Ordering::Relaxed), 50);
         assert_eq!(metrics.errors.load(Ordering::Relaxed), 1);
@@ -1269,6 +1316,8 @@ mod tests {
         metrics.record_request();
         metrics.record_request();
         metrics.record_tool_calls(5);
+        metrics.record_tool_schema_retrieval();
+        metrics.record_tool_validation_failure();
         metrics.record_tokens(1000, 500);
         metrics.record_error();
         reg.set_metrics(Arc::clone(&metrics));
@@ -1278,6 +1327,8 @@ mod tests {
         assert!(json.contains("\"tool_calls\":5"));
         assert!(json.contains("\"input_tokens\":1000"));
         assert!(json.contains("\"output_tokens\":500"));
+        assert!(json.contains("\"tool_schema_retrieval_count\":1"));
+        assert!(json.contains("\"tool_validation_failure_count\":1"));
         assert!(json.contains("\"errors\":1"));
     }
 

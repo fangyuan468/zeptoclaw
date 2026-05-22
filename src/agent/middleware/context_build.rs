@@ -69,7 +69,10 @@ impl Middleware for ContextBuildMiddleware {
         // Get tool definitions (short-lived read lock).
         let tool_definitions = {
             let tools = ctx.subsystems.tools.read().await;
-            tools.definitions_with_options(ctx.config.agents.defaults.compact_tools)
+            tools.definitions_for_mode(
+                ctx.config.agents.defaults.lazy_tool_schema,
+                ctx.config.agents.defaults.compact_tools,
+            )
         };
         ctx.tool_definitions = Some(tool_definitions);
 

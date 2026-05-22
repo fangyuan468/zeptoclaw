@@ -953,11 +953,13 @@ async fn resolve_tool_approval(
 async fn needs_sequential_execution(
     tools: &Arc<RwLock<ToolRegistry>>,
     tool_calls: &[LLMToolCall],
+    lazy_tool_schema: bool,
 ) -> bool {
     let guard = tools.read().await;
     tool_calls.iter().any(|tc| {
+        let name = resolve_tool_call_name(&guard, &tc.name, lazy_tool_schema).0;
         guard
-            .get(&tc.name)
+            .get(&name)
             .map(|t| {
                 matches!(
                     t.category(),
@@ -966,6 +968,25 @@ async fn needs_sequential_execution(
             })
             .unwrap_or(true) // unknown tool → serialize to be safe
     })
+}
+
+fn resolve_tool_call_name(
+    tools: &ToolRegistry,
+    provider_name: &str,
+    lazy_tool_schema: bool,
+) -> (String, String) {
+    if !lazy_tool_schema {
+        let exposed = tools
+            .exposed_name_for_tool(provider_name)
+            .unwrap_or_else(|| provider_name.to_string());
+        return (provider_name.to_string(), exposed);
+    }
+
+    if let Some(handle) = tools.resolve_exposed(provider_name) {
+        return (handle.tool_name, handle.exposed_name);
+    }
+
+    (provider_name.to_string(), provider_name.to_string())
 }
 
 /// Check the loop guard for repeated tool-call patterns.
@@ -1972,7 +1993,10 @@ impl AgentLoop {
         // Get tool definitions (short-lived read lock)
         let tool_definitions = {
             let tools = self.tools.read().await;
-            tools.definitions_with_options(self.config.agents.defaults.compact_tools)
+            tools.definitions_for_mode(
+                self.config.agents.defaults.lazy_tool_schema,
+                self.config.agents.defaults.compact_tools,
+            )
         };
 
         // Pre-flight context guard: trim oversized tool results and check budget
@@ -2105,7 +2129,10 @@ impl AgentLoop {
                     .await;
                 last_tool_defs = {
                     let tools = self.tools.read().await;
-                    tools.definitions_with_options(self.config.agents.defaults.compact_tools)
+                    tools.definitions_for_mode(
+                        self.config.agents.defaults.lazy_tool_schema,
+                        self.config.agents.defaults.compact_tools,
+                    )
                 };
                 result = provider
                     .chat(
@@ -2267,14 +2294,22 @@ impl AgentLoop {
             let is_dry_run = self.dry_run.load(Ordering::SeqCst);
             let current_agent_mode = self.agent_mode;
             let trusted_local_session = is_trusted_local_session(msg);
+            let lazy_tool_schema = self.config.agents.defaults.lazy_tool_schema;
+            let any_approval_gated_tool = if approval_handler.is_some() {
+                let guard = self.tools.read().await;
+                response.tool_calls.iter().any(|tool_call| {
+                    let name = resolve_tool_call_name(&guard, &tool_call.name, lazy_tool_schema).0;
+                    approval_gate.requires_approval(&name)
+                })
+            } else {
+                false
+            };
 
             let run_sequential = (!trusted_local_session
                 && approval_handler.is_some()
-                && response
-                    .tool_calls
-                    .iter()
-                    .any(|tool_call| approval_gate.requires_approval(&tool_call.name)))
-                || needs_sequential_execution(&self.tools, &response.tool_calls).await;
+                && any_approval_gated_tool)
+                || needs_sequential_execution(&self.tools, &response.tool_calls, lazy_tool_schema)
+                    .await;
             let tool_timeout_secs = if self.config.agents.defaults.tool_timeout_secs > 0 {
                 self.config.agents.defaults.tool_timeout_secs
             } else {
@@ -2319,6 +2354,28 @@ impl AgentLoop {
                                 serde_json::json!({"_parse_error": format!("Invalid arguments JSON: {}", e)})
                             }
                         };
+                        let (name, exposed_name) = {
+                            let tools_guard = tools.read().await;
+                            resolve_tool_call_name(&tools_guard, &name, lazy_tool_schema)
+                        };
+
+                        if lazy_tool_schema {
+                            let validation_error = {
+                                let tools_guard = tools.read().await;
+                                tools_guard.validate_tool_args_lazy(&name, &args, &exposed_name)
+                            };
+                            if let Some(output) = validation_error {
+                                if let Some(metrics) = usage_metrics.as_ref() {
+                                    metrics.record_tool_validation_failure();
+                                }
+                                return (id, output.for_llm, false);
+                            }
+                            if name == "get_tool_schema" {
+                                if let Some(metrics) = usage_metrics.as_ref() {
+                                    metrics.record_tool_schema_retrieval();
+                                }
+                            }
+                        }
 
                         // Check hooks before executing
                         let channel_name = ctx.channel.as_deref().unwrap_or("cli");
@@ -2740,7 +2797,10 @@ impl AgentLoop {
             // Get fresh tool definitions for the next LLM call
             let tool_definitions = {
                 let tools = self.tools.read().await;
-                tools.definitions_with_options(self.config.agents.defaults.compact_tools)
+                tools.definitions_for_mode(
+                    self.config.agents.defaults.lazy_tool_schema,
+                    self.config.agents.defaults.compact_tools,
+                )
             };
 
             // Check token budget before next LLM call
@@ -2836,7 +2896,10 @@ impl AgentLoop {
                         .await;
                     last_tool_defs = {
                         let tools = self.tools.read().await;
-                        tools.definitions_with_options(self.config.agents.defaults.compact_tools)
+                        tools.definitions_for_mode(
+                            self.config.agents.defaults.lazy_tool_schema,
+                            self.config.agents.defaults.compact_tools,
+                        )
                     };
                     result = provider
                         .chat(
@@ -3030,7 +3093,10 @@ impl AgentLoop {
 
         let tool_definitions = {
             let tools = self.tools.read().await;
-            tools.definitions_with_options(self.config.agents.defaults.compact_tools)
+            tools.definitions_for_mode(
+                self.config.agents.defaults.lazy_tool_schema,
+                self.config.agents.defaults.compact_tools,
+            )
         };
 
         // Pre-flight context guard (streaming)
@@ -3130,7 +3196,10 @@ impl AgentLoop {
                     .await;
                 last_tool_defs = {
                     let tools = self.tools.read().await;
-                    tools.definitions_with_options(self.config.agents.defaults.compact_tools)
+                    tools.definitions_for_mode(
+                        self.config.agents.defaults.lazy_tool_schema,
+                        self.config.agents.defaults.compact_tools,
+                    )
                 };
                 result = provider
                     .chat(
@@ -3271,14 +3340,22 @@ impl AgentLoop {
             let is_dry_run_stream = self.dry_run.load(Ordering::SeqCst);
             let current_agent_mode_stream = self.agent_mode;
             let trusted_local_session = is_trusted_local_session(msg);
+            let lazy_tool_schema = self.config.agents.defaults.lazy_tool_schema;
+            let any_approval_gated_tool = if approval_handler.is_some() {
+                let guard = self.tools.read().await;
+                response.tool_calls.iter().any(|tool_call| {
+                    let name = resolve_tool_call_name(&guard, &tool_call.name, lazy_tool_schema).0;
+                    approval_gate.requires_approval(&name)
+                })
+            } else {
+                false
+            };
 
             let run_sequential = (!trusted_local_session
                 && approval_handler.is_some()
-                && response
-                    .tool_calls
-                    .iter()
-                    .any(|tool_call| approval_gate.requires_approval(&tool_call.name)))
-                || needs_sequential_execution(&self.tools, &response.tool_calls).await;
+                && any_approval_gated_tool)
+                || needs_sequential_execution(&self.tools, &response.tool_calls, lazy_tool_schema)
+                    .await;
             let tool_timeout_secs = if self.config.agents.defaults.tool_timeout_secs > 0 {
                 self.config.agents.defaults.tool_timeout_secs
             } else {
@@ -3323,6 +3400,28 @@ impl AgentLoop {
                                 serde_json::json!({"_parse_error": format!("Invalid arguments JSON: {}", e)})
                             }
                         };
+                        let (name, exposed_name) = {
+                            let tools_guard = tools.read().await;
+                            resolve_tool_call_name(&tools_guard, &name, lazy_tool_schema)
+                        };
+
+                        if lazy_tool_schema {
+                            let validation_error = {
+                                let tools_guard = tools.read().await;
+                                tools_guard.validate_tool_args_lazy(&name, &args, &exposed_name)
+                            };
+                            if let Some(output) = validation_error {
+                                if let Some(metrics) = usage_metrics.as_ref() {
+                                    metrics.record_tool_validation_failure();
+                                }
+                                return (id, output.for_llm, false);
+                            }
+                            if name == "get_tool_schema" {
+                                if let Some(metrics) = usage_metrics.as_ref() {
+                                    metrics.record_tool_schema_retrieval();
+                                }
+                            }
+                        }
 
                         let channel_name = ctx.channel.as_deref().unwrap_or("cli");
                         let chat_id = ctx.chat_id.as_deref().unwrap_or(channel_name);
@@ -3645,7 +3744,10 @@ impl AgentLoop {
 
             let tool_definitions = {
                 let tools = self.tools.read().await;
-                tools.definitions_with_options(self.config.agents.defaults.compact_tools)
+                tools.definitions_for_mode(
+                    self.config.agents.defaults.lazy_tool_schema,
+                    self.config.agents.defaults.compact_tools,
+                )
             };
 
             // Check token budget before next LLM call
@@ -3739,7 +3841,10 @@ impl AgentLoop {
                         .await;
                     last_tool_defs = {
                         let tools = self.tools.read().await;
-                        tools.definitions_with_options(self.config.agents.defaults.compact_tools)
+                        tools.definitions_for_mode(
+                            self.config.agents.defaults.lazy_tool_schema,
+                            self.config.agents.defaults.compact_tools,
+                        )
                     };
                     result = provider
                         .chat(
@@ -6186,7 +6291,7 @@ tail line
             },
         ]);
         let calls = vec![make_tool_call("write_file"), make_tool_call("read_file")];
-        assert!(needs_sequential_execution(&reg, &calls).await);
+        assert!(needs_sequential_execution(&reg, &calls, false).await);
     }
 
     #[tokio::test]
@@ -6202,7 +6307,7 @@ tail line
             },
         ]);
         let calls = vec![make_tool_call("shell"), make_tool_call("read_file")];
-        assert!(needs_sequential_execution(&reg, &calls).await);
+        assert!(needs_sequential_execution(&reg, &calls, false).await);
     }
 
     #[tokio::test]
@@ -6218,7 +6323,7 @@ tail line
             },
         ]);
         let calls = vec![make_tool_call("read_file"), make_tool_call("web_fetch")];
-        assert!(!needs_sequential_execution(&reg, &calls).await);
+        assert!(!needs_sequential_execution(&reg, &calls, false).await);
     }
 
     #[tokio::test]
@@ -6229,7 +6334,7 @@ tail line
         }]);
         // "mystery_tool" is not in the registry → should default to sequential.
         let calls = vec![make_tool_call("read_file"), make_tool_call("mystery_tool")];
-        assert!(needs_sequential_execution(&reg, &calls).await);
+        assert!(needs_sequential_execution(&reg, &calls, false).await);
     }
 
     #[tokio::test]
@@ -6239,7 +6344,7 @@ tail line
             category: ToolCategory::Memory,
         }]);
         let calls = vec![make_tool_call("memory_search")];
-        assert!(!needs_sequential_execution(&reg, &calls).await);
+        assert!(!needs_sequential_execution(&reg, &calls, false).await);
     }
 
     // ----------------------------------------------------------------

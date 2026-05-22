@@ -231,6 +231,13 @@ pub trait Tool: Send + Sync {
         self.description()
     }
 
+    /// Candidate name exposed to LLM providers when lazy schemas are enabled.
+    ///
+    /// The registry still sanitizes, length-limits, and de-duplicates this name.
+    fn lazy_exposed_name_candidate(&self) -> String {
+        format!("internal__{}", self.name())
+    }
+
     /// Tool category for agent mode enforcement.
     ///
     /// The agent mode system uses this to determine whether a tool is allowed,
