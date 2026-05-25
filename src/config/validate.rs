@@ -60,6 +60,7 @@ const KNOWN_AGENTS_DEFAULTS: &[&str] = &[
     "streaming",
     "token_budget",
     "compact_tools",
+    "lazy_tool_schema",
     "tool_profile",
     "active_hand",
     "timezone",
@@ -880,9 +881,11 @@ mod tests {
 
     #[test]
     fn test_validate_compact_tools_known() {
-        let json = json!({"agents": {"defaults": {"compact_tools": true}}});
+        let json =
+            json!({"agents": {"defaults": {"compact_tools": true, "lazy_tool_schema": true}}});
         let diags = validate_config(&json);
         assert!(!diags.iter().any(|d| d.message.contains("compact_tools")));
+        assert!(!diags.iter().any(|d| d.message.contains("lazy_tool_schema")));
     }
 
     #[test]

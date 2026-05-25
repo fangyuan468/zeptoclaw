@@ -155,7 +155,7 @@ impl Tool for ReadFileTool {
     }
 
     fn compact_description(&self) -> &str {
-        "Read file"
+        "Read workspace file"
     }
 
     fn category(&self) -> ToolCategory {
@@ -168,7 +168,7 @@ impl Tool for ReadFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The path to the file to read"
+                    "description": "Workspace-relative path to the file to read (for example, 'dir/file.txt'). Absolute paths are allowed only inside the configured workspace."
                 }
             },
             "required": ["path"]
@@ -231,7 +231,7 @@ impl Tool for WriteFileTool {
     }
 
     fn compact_description(&self) -> &str {
-        "Write file"
+        "Write workspace file"
     }
 
     fn category(&self) -> ToolCategory {
@@ -244,7 +244,7 @@ impl Tool for WriteFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The path to the file to write"
+                    "description": "Workspace-relative path to the file to write (for example, 'dir/file.txt'). Absolute paths are allowed only inside the configured workspace."
                 },
                 "content": {
                     "type": "string",
@@ -311,7 +311,7 @@ impl Tool for ListDirTool {
     }
 
     fn compact_description(&self) -> &str {
-        "List directory"
+        "List workspace directory"
     }
 
     fn category(&self) -> ToolCategory {
@@ -324,7 +324,7 @@ impl Tool for ListDirTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The path to the directory to list"
+                    "description": "Workspace-relative path to the directory to list; use '.' for the workspace root. Absolute paths are allowed only inside the configured workspace."
                 }
             },
             "required": ["path"]
@@ -414,7 +414,7 @@ impl Tool for EditFileTool {
     }
 
     fn compact_description(&self) -> &str {
-        "Edit file"
+        "Edit workspace file"
     }
 
     fn category(&self) -> ToolCategory {
@@ -427,7 +427,7 @@ impl Tool for EditFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The path to the file to edit"
+                    "description": "Workspace-relative path to the file to edit (for example, 'dir/file.txt'). Absolute paths are allowed only inside the configured workspace."
                 },
                 "old_text": {
                     "type": "string",

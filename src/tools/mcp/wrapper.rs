@@ -65,6 +65,10 @@ impl Tool for McpToolWrapper {
         self.description()
     }
 
+    fn lazy_exposed_name_candidate(&self) -> String {
+        format!("mcp__{}__{}", self.client.server_name(), self.remote_name)
+    }
+
     fn category(&self) -> ToolCategory {
         ToolCategory::NetworkWrite
     }

@@ -747,6 +747,9 @@ pub struct AgentDefaults {
     /// Use compact (shorter) tool descriptions to save tokens.
     #[serde(default)]
     pub compact_tools: bool,
+    /// Expose compact tool schemas and let the model fetch full schemas on demand.
+    #[serde(default)]
+    pub lazy_tool_schema: bool,
     /// Default tool profile name (from `tool_profiles`). Omit for all tools.
     #[serde(default)]
     pub tool_profile: Option<String>,
@@ -820,6 +823,7 @@ impl Default for AgentDefaults {
             streaming: true,
             token_budget: 0,
             compact_tools: false,
+            lazy_tool_schema: false,
             tool_profile: None,
             active_hand: None,
             timezone: default_timezone(),
@@ -2788,15 +2792,16 @@ mod tests {
     fn test_compact_tools_default_false() {
         let defaults = AgentDefaults::default();
         assert!(!defaults.compact_tools);
+        assert!(!defaults.lazy_tool_schema);
         assert!(defaults.tool_profile.is_none());
     }
 
     #[test]
     fn test_compact_tools_deserialize() {
-        let json =
-            r#"{"agents": {"defaults": {"compact_tools": true, "tool_profile": "minimal"}}}"#;
+        let json = r#"{"agents": {"defaults": {"compact_tools": true, "lazy_tool_schema": true, "tool_profile": "minimal"}}}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.agents.defaults.compact_tools);
+        assert!(config.agents.defaults.lazy_tool_schema);
         assert_eq!(
             config.agents.defaults.tool_profile.as_ref().unwrap(),
             "minimal"

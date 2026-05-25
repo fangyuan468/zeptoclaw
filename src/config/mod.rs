@@ -187,6 +187,9 @@ impl Config {
         if let Ok(val) = std::env::var("ZEPTOCLAW_AGENTS_DEFAULTS_COMPACT_TOOLS") {
             self.agents.defaults.compact_tools = val == "true" || val == "1";
         }
+        if let Ok(val) = std::env::var("ZEPTOCLAW_AGENTS_DEFAULTS_LAZY_TOOL_SCHEMA") {
+            self.agents.defaults.lazy_tool_schema = val == "true" || val == "1";
+        }
         if let Ok(val) = std::env::var("ZEPTOCLAW_AGENTS_DEFAULTS_TOOL_PROFILE") {
             self.agents.defaults.tool_profile = if val.is_empty() { None } else { Some(val) };
         }
@@ -2330,6 +2333,15 @@ mod tests {
         config.apply_env_overrides();
         assert!(config.agents.defaults.compact_tools);
         std::env::remove_var("ZEPTOCLAW_AGENTS_DEFAULTS_COMPACT_TOOLS");
+    }
+
+    #[test]
+    fn test_env_override_lazy_tool_schema() {
+        std::env::set_var("ZEPTOCLAW_AGENTS_DEFAULTS_LAZY_TOOL_SCHEMA", "true");
+        let mut config = Config::default();
+        config.apply_env_overrides();
+        assert!(config.agents.defaults.lazy_tool_schema);
+        std::env::remove_var("ZEPTOCLAW_AGENTS_DEFAULTS_LAZY_TOOL_SCHEMA");
     }
 
     #[test]

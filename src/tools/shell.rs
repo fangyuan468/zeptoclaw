@@ -114,11 +114,11 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return the output"
+        "Execute a shell command from the configured workspace and return the output"
     }
 
     fn compact_description(&self) -> &str {
-        "Run shell command"
+        "Run shell command in workspace"
     }
 
     fn category(&self) -> ToolCategory {
@@ -131,7 +131,7 @@ impl Tool for ShellTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "The shell command to execute. The command starts in the configured workspace; prefer workspace-relative paths."
                 },
                 "timeout": {
                     "type": "integer",
