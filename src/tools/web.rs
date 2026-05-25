@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
-use reqwest::{Client, Url};
+use reqwest::{Client, StatusCode, Url};
 use scraper::node::Node;
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
@@ -29,6 +29,10 @@ const DEFAULT_MAX_FETCH_CHARS: usize = 50_000;
 const MAX_FETCH_CHARS: usize = 200_000;
 const MIN_FETCH_CHARS: usize = 256;
 const MAX_WEB_FETCH_REDIRECTS: usize = 5;
+const WEB_FETCH_MAX_ATTEMPTS: usize = 3;
+const WEB_FETCH_RETRY_DELAYS_MS: [u64; 2] = [300, 1_000];
+const REDIRECT_BLOCK_HOST_PREFIX: &str = "Redirect destination is blocked";
+const REDIRECT_BLOCK_SCHEME_PREFIX: &str = "Redirect destination scheme is blocked";
 /// Maximum bytes to read from a response body before truncating.
 /// Uses a 4x multiplier over MAX_FETCH_CHARS to account for multi-byte UTF-8.
 const MAX_FETCH_BYTES: usize = MAX_FETCH_CHARS * 4;
@@ -738,12 +742,16 @@ impl Tool for WebFetchTool {
             self.client.clone()
         };
 
-        let response = client
-            .get(parsed.clone())
-            .header("User-Agent", WEB_USER_AGENT)
-            .send()
-            .await
-            .map_err(|e| ZeptoError::Tool(format!("Web fetch failed: {}", e)))?;
+        let response = match send_web_fetch_request(&client, &parsed).await {
+            Ok(response) => response,
+            Err(e) => {
+                if let Some(err) = redirect_security_error(&e) {
+                    return Err(err);
+                }
+                let failure = classify_reqwest_error(&e);
+                return Ok(web_fetch_failure_output(url, failure, e.to_string()));
+            }
+        };
 
         // Defense in depth: validate the final destination URL as well.
         validate_redirect_target(response.url()).await?;
@@ -752,7 +760,11 @@ impl Tool for WebFetchTool {
         let final_url = response.url().to_string();
 
         if !status.is_success() {
-            return Err(ZeptoError::Tool(format!("HTTP error: {}", status)));
+            return Ok(web_fetch_failure_output(
+                url,
+                WebFetchFailureKind::HttpStatus(status),
+                format!("HTTP error: {}", status),
+            ));
         }
 
         let content_type = response
@@ -764,7 +776,16 @@ impl Tool for WebFetchTool {
 
         // Read body in chunks with a size limit to prevent unbounded memory
         // allocation from malicious or oversized responses.
-        let body = read_body_limited(response, MAX_FETCH_BYTES).await?;
+        let body = match read_body_limited(response, MAX_FETCH_BYTES).await {
+            Ok(body) => body,
+            Err(e) => {
+                return Ok(web_fetch_failure_output(
+                    url,
+                    WebFetchFailureKind::BodyReadFailed,
+                    e.to_string(),
+                ));
+            }
+        };
 
         let include_links = args
             .get("include_links")
@@ -808,6 +829,168 @@ impl Tool for WebFetchTool {
             })
             .to_string(),
         ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebFetchFailureKind {
+    Timeout,
+    DnsFailed,
+    ProxyFailed,
+    TlsFailed,
+    HttpStatus(StatusCode),
+    BodyReadFailed,
+    RequestFailed,
+}
+
+impl WebFetchFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::DnsFailed => "dns_failed",
+            Self::ProxyFailed => "proxy_failed",
+            Self::TlsFailed => "tls_failed",
+            Self::HttpStatus(_) => "http_status",
+            Self::BodyReadFailed => "body_read_failed",
+            Self::RequestFailed => "request_failed",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Timeout => "The page did not respond in time. Try another source or rely on search snippets.",
+            Self::DnsFailed => "DNS resolution failed. Try another source or rely on search snippets.",
+            Self::ProxyFailed => "The proxy/network path failed. Do not retry the same URL repeatedly; use search snippets or another source.",
+            Self::TlsFailed => "TLS/certificate negotiation failed. Try another source or rely on search snippets.",
+            Self::HttpStatus(status)
+                if status == StatusCode::UNAUTHORIZED
+                    || status == StatusCode::FORBIDDEN
+                    || status == StatusCode::PROXY_AUTHENTICATION_REQUIRED =>
+            {
+                "The site requires authorization or denied the request. Use search snippets or another accessible source."
+            }
+            Self::HttpStatus(status) if status.as_u16() == 404 => {
+                "The page was not found. Try another source."
+            }
+            Self::HttpStatus(status) if status == StatusCode::TOO_MANY_REQUESTS => {
+                "Rate-limited; do not retry this URL immediately. Try a different source instead."
+            }
+            Self::HttpStatus(_) => "The server returned a non-success status. Try another source or rely on search snippets.",
+            Self::BodyReadFailed => "The response started but could not be read. Try another source or rely on search snippets.",
+            Self::RequestFailed => "The request failed. Try another source or rely on search snippets.",
+        }
+    }
+
+    fn retryable(self) -> bool {
+        matches!(self, Self::Timeout | Self::DnsFailed)
+    }
+}
+
+async fn send_web_fetch_request(
+    client: &Client,
+    parsed: &Url,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let mut last_err = None;
+
+    for attempt in 0..WEB_FETCH_MAX_ATTEMPTS {
+        match client
+            .get(parsed.clone())
+            .header("User-Agent", WEB_USER_AGENT)
+            .send()
+            .await
+        {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                let kind = classify_reqwest_error(&err);
+                let retryable = kind.retryable() && redirect_security_error(&err).is_none();
+                last_err = Some(err);
+
+                let Some(delay_ms) = WEB_FETCH_RETRY_DELAYS_MS
+                    .get(attempt)
+                    .copied()
+                    .filter(|_| retryable)
+                else {
+                    break;
+                };
+
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    Err(last_err.expect("web fetch attempted at least once"))
+}
+
+fn web_fetch_failure_output(
+    url: &str,
+    kind: WebFetchFailureKind,
+    detail: impl Into<String>,
+) -> ToolOutput {
+    ToolOutput::llm_only(
+        json!({
+            "ok": false,
+            "url": url,
+            "error_kind": kind.as_str(),
+            "status": match kind {
+                WebFetchFailureKind::HttpStatus(status) => Some(status.as_u16()),
+                _ => None,
+            },
+            "detail": detail.into(),
+            "hint": kind.hint(),
+        })
+        .to_string(),
+    )
+}
+
+fn classify_reqwest_error(error: &reqwest::Error) -> WebFetchFailureKind {
+    classify_fetch_error(
+        &error.to_string(),
+        error.is_timeout(),
+        error.is_connect(),
+        error.status(),
+        has_http_proxy(),
+    )
+}
+
+fn classify_fetch_error(
+    detail: &str,
+    is_timeout: bool,
+    is_connect: bool,
+    status: Option<StatusCode>,
+    has_proxy: bool,
+) -> WebFetchFailureKind {
+    if let Some(status) = status {
+        return WebFetchFailureKind::HttpStatus(status);
+    }
+    if is_timeout {
+        return WebFetchFailureKind::Timeout;
+    }
+
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("tls") || lower.contains("certificate") || lower.contains("ssl") {
+        return WebFetchFailureKind::TlsFailed;
+    }
+    if lower.contains("dns")
+        || lower.contains("lookup")
+        || lower.contains("name resolution")
+        || lower.contains("failed to resolve")
+    {
+        return WebFetchFailureKind::DnsFailed;
+    }
+    if has_proxy && (is_connect || lower.contains("proxy")) {
+        return WebFetchFailureKind::ProxyFailed;
+    }
+
+    WebFetchFailureKind::RequestFailed
+}
+
+fn redirect_security_error(error: &reqwest::Error) -> Option<ZeptoError> {
+    let detail = error.to_string();
+    if detail.contains(REDIRECT_BLOCK_HOST_PREFIX) || detail.contains(REDIRECT_BLOCK_SCHEME_PREFIX)
+    {
+        Some(ZeptoError::SecurityViolation(detail))
+    } else {
+        None
     }
 }
 
@@ -1121,7 +1304,8 @@ pub fn validate_redirect_target_basic(url: &Url) -> Result<()> {
         "http" | "https" => {}
         _ => {
             return Err(ZeptoError::SecurityViolation(format!(
-                "Redirect destination scheme is blocked: {}",
+                "{}: {}",
+                REDIRECT_BLOCK_SCHEME_PREFIX,
                 url.scheme()
             )));
         }
@@ -1129,8 +1313,8 @@ pub fn validate_redirect_target_basic(url: &Url) -> Result<()> {
 
     if is_blocked_host(url) {
         return Err(ZeptoError::SecurityViolation(format!(
-            "Redirect destination is blocked (local or private network): {}",
-            url
+            "{} (local or private network): {}",
+            REDIRECT_BLOCK_HOST_PREFIX, url
         )));
     }
 
@@ -1486,6 +1670,65 @@ mod tests {
         let tool = WebFetchTool::new();
         assert_eq!(tool.name(), "web_fetch");
         assert!(tool.description().contains("Fetch"));
+    }
+
+    #[test]
+    fn test_web_fetch_error_classification() {
+        assert_eq!(
+            classify_fetch_error("request timed out", true, false, None, false),
+            WebFetchFailureKind::Timeout
+        );
+        assert_eq!(
+            classify_fetch_error(
+                "failed to lookup address information: Temporary failure in name resolution",
+                false,
+                false,
+                None,
+                true,
+            ),
+            WebFetchFailureKind::DnsFailed
+        );
+        assert_eq!(
+            classify_fetch_error("proxy connect failed", false, true, None, true),
+            WebFetchFailureKind::ProxyFailed
+        );
+        assert_eq!(
+            classify_fetch_error("certificate verify failed", false, false, None, false),
+            WebFetchFailureKind::TlsFailed
+        );
+        assert_eq!(
+            classify_fetch_error(
+                "bad status",
+                false,
+                false,
+                Some(StatusCode::FORBIDDEN),
+                false
+            ),
+            WebFetchFailureKind::HttpStatus(StatusCode::FORBIDDEN)
+        );
+
+        assert!(WebFetchFailureKind::Timeout.retryable());
+        assert!(WebFetchFailureKind::DnsFailed.retryable());
+        assert!(!WebFetchFailureKind::ProxyFailed.retryable());
+        assert!(!WebFetchFailureKind::RequestFailed.retryable());
+        assert_eq!(
+            WebFetchFailureKind::HttpStatus(StatusCode::TOO_MANY_REQUESTS).hint(),
+            "Rate-limited; do not retry this URL immediately. Try a different source instead."
+        );
+    }
+
+    #[test]
+    fn test_web_fetch_failure_output_is_non_fatal_for_llm() {
+        let output = web_fetch_failure_output(
+            "https://example.com/",
+            WebFetchFailureKind::ProxyFailed,
+            "proxy connect failed",
+        );
+
+        assert!(!output.is_error);
+        assert!(output.for_llm.contains("\"ok\":false"));
+        assert!(output.for_llm.contains("\"error_kind\":\"proxy_failed\""));
+        assert!(output.for_llm.contains("search snippets"));
     }
 
     #[test]
