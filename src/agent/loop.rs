@@ -532,6 +532,21 @@ fn resolve_streamed_response_text(delta_accum: &str, done_content: &str) -> Stri
     }
 }
 
+fn assistant_message_with_tool_calls(tool_calls: &[LLMToolCall]) -> Message {
+    let mut assistant_msg = Message::assistant("");
+    assistant_msg.tool_calls = Some(
+        tool_calls
+            .iter()
+            .map(|tc| ToolCall {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                arguments: tc.arguments.clone(),
+            })
+            .collect(),
+    );
+    assistant_msg
+}
+
 fn parse_mermaid_xychart_spec(content: &str) -> Option<MermaidXyChartSpec> {
     if !content.contains("xychart-beta") {
         return None;
@@ -2242,19 +2257,10 @@ impl AgentLoop {
             }
 
             // Add assistant message with tool calls (post-truncation).
-            let mut assistant_msg = Message::assistant(&response.content);
-            assistant_msg.tool_calls = Some(
-                response
-                    .tool_calls
-                    .iter()
-                    .map(|tc| ToolCall {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments: tc.arguments.clone(),
-                    })
-                    .collect(),
-            );
-            session.add_message(assistant_msg);
+            // Some OpenAI-compatible providers also echo provider-specific
+            // tool-call markup in `content`; the structured tool_calls are
+            // the source of truth, so keep that markup out of future prompts.
+            session.add_message(assistant_message_with_tool_calls(&response.tool_calls));
 
             // Execute tool calls in parallel
             let workspace = self.config.workspace_path();
@@ -3288,19 +3294,10 @@ impl AgentLoop {
             }
 
             // Add assistant message with tool calls (post-truncation).
-            let mut assistant_msg = Message::assistant(&response.content);
-            assistant_msg.tool_calls = Some(
-                response
-                    .tool_calls
-                    .iter()
-                    .map(|tc| ToolCall {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments: tc.arguments.clone(),
-                    })
-                    .collect(),
-            );
-            session.add_message(assistant_msg);
+            // Some OpenAI-compatible providers also echo provider-specific
+            // tool-call markup in `content`; the structured tool_calls are
+            // the source of truth, so keep that markup out of future prompts.
+            session.add_message(assistant_message_with_tool_calls(&response.tool_calls));
 
             let workspace = self.config.workspace_path();
             let workspace_str = workspace.to_string_lossy();
@@ -5052,6 +5049,20 @@ tail line
     fn test_resolve_streamed_response_text_prefers_done_content_when_present() {
         let resolved = resolve_streamed_response_text("chunk-a chunk-b", "final body");
         assert_eq!(resolved, "final body");
+    }
+
+    #[test]
+    fn test_assistant_message_with_tool_calls_keeps_markup_out_of_content() {
+        let tool_call = LLMToolCall::new("call_1", "internal__web_search", r#"{"query":"news"}"#);
+
+        let message = assistant_message_with_tool_calls(&[tool_call]);
+
+        assert_eq!(message.content, "");
+        let calls = message.tool_calls.expect("tool calls should be preserved");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "internal__web_search");
+        assert_eq!(calls[0].arguments, r#"{"query":"news"}"#);
     }
 
     #[test]
