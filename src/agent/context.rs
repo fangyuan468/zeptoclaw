@@ -18,33 +18,15 @@ pub fn format_message_envelope() -> String {
 }
 
 /// Default system prompt for ZeptoClaw agent
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are ZeptoClaw, an ultra-lightweight personal AI assistant.
+const DEFAULT_SYSTEM_PROMPT: &str = r#"You are ZeptoClaw, a concise personal AI assistant. Use tools when useful.
 
-You have access to tools to help accomplish tasks. Use them when needed.
+Memory: use longterm_memory to save durable facts, user preferences, decisions, and critical pinned facts; recall them with action "search" when relevant.
 
-Be concise but helpful. Focus on completing the user's request efficiently.
+Use ask_clarification for missing required info, real ambiguity, or destructive/irreversible actions; not trivial choices.
 
-You have a longterm_memory tool. Use it proactively to:
-- Save important facts, user preferences, and decisions for future recall
-- Recall relevant information from past conversations by calling longterm_memory with action "search"
-- Pin critical information that should always be available
+Scheduled messages: `Reminder:` means the scheduler delivered a reminder; notify the user in the reminder's voice. For heartbeat workspace checks, reply `HEARTBEAT_OK` when nothing needs action, otherwise act.
 
-## Scheduled & Background Messages
-
-When a message begins with `Reminder:`, it was delivered by the scheduler on behalf of the user — not typed by them now. Respond with a friendly, concise notification of the reminder content, as if you're the reminder itself notifying the user.
-
-When a message is the heartbeat prompt (checking workspace tasks), reply with `HEARTBEAT_OK` if there is nothing actionable to do, or take the requested action if there is.
-
-You have an ask_clarification tool. When facing ambiguity, use it instead of guessing:
-- Missing information needed to proceed
-- Multiple valid approaches to choose from
-- Destructive or irreversible actions that need confirmation
-- Ambiguous requirements that could be interpreted different ways
-Do not over-use it for trivial decisions you can make yourself.
-
-## Visual Rendering (text-only channel)
-
-This channel cannot render rich UI. When asked for a chart / plot / histogram / dashboard, reply with a concise text description plus a small markdown table when it helps. Do NOT emit JSON UI payloads, mermaid blocks, or Python plotting code unless the user explicitly asks for the code."#;
+Visuals on a text-only channel: answer charts/dashboards with concise prose and, when useful, a markdown table. Do not emit JSON UI, Mermaid, or plotting code unless requested."#;
 
 /// Optional system prompt segment appended only when the active channel can
 /// render A2UI surfaces (e.g. the Tauri client over `acp_http`). Channels
@@ -1296,7 +1278,7 @@ mod tests {
         );
         assert!(
             A2UI_RENDERING_PROMPT_SUFFIX.contains("```a2ui"),
-            "A2UI suffix must include a copy-paste-ready ```a2ui example"
+            "A2UI suffix must include a valid ```a2ui shape example"
         );
         assert!(
             A2UI_RENDERING_PROMPT_SUFFIX.contains("Do NOT call `shell`"),
@@ -1326,6 +1308,20 @@ mod tests {
         assert!(
             DEFAULT_SYSTEM_PROMPT.contains("text-only channel"),
             "Default prompt must include the text-only visual rendering note"
+        );
+    }
+
+    #[test]
+    fn test_prompt_size_budgets() {
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.len() <= 768,
+            "DEFAULT_SYSTEM_PROMPT is {} bytes; keep it <= 768",
+            DEFAULT_SYSTEM_PROMPT.len()
+        );
+        assert!(
+            A2UI_RENDERING_PROMPT_SUFFIX.len() <= 1700,
+            "A2UI_RENDERING_PROMPT_SUFFIX is {} bytes; keep it <= 1700",
+            A2UI_RENDERING_PROMPT_SUFFIX.len()
         );
     }
 
