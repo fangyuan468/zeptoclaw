@@ -346,9 +346,12 @@ pub(crate) async fn create_agent_with_template(
         }
     }
 
-    // Build runtime context for environment awareness (time, platform, etc.)
+    // Build runtime context for environment awareness (time, platform, workspace, etc.)
+    let workspace_path = config.workspace_path();
+    let workspace_str = workspace_path.to_string_lossy();
     let runtime_ctx = RuntimeContext::new()
         .with_timezone(&config.agents.defaults.timezone)
+        .with_workspace(workspace_str.as_ref())
         .with_os_info();
     context_builder = context_builder.with_runtime_context(runtime_ctx);
 

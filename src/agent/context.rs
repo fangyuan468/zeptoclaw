@@ -256,6 +256,9 @@ impl RuntimeContext {
         }
         if let Some(ref workspace) = self.workspace {
             parts.push(format!("- Workspace: {}", workspace));
+            parts.push(
+                "- Workspace path rules: filesystem tools are scoped here. Prefer relative paths like `.` or `dir/file`; do not invent host paths outside the configured workspace.".to_string(),
+            );
         }
         if let Some(ref os) = self.os_info {
             parts.push(format!("- Platform: {}", os));
@@ -1025,6 +1028,8 @@ mod tests {
         assert!(!ctx.is_empty());
         let rendered = ctx.render().unwrap();
         assert!(rendered.contains("Workspace: /home/user/project"));
+        assert!(rendered.contains("Workspace path rules:"));
+        assert!(rendered.contains("Prefer relative paths"));
     }
 
     #[test]
