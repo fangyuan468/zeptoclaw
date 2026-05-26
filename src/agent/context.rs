@@ -203,6 +203,13 @@ impl RuntimeContext {
     ///
     /// Returns `None` if no context fields are set.
     ///
+    /// Kept for backward compatibility: emits a single `## Runtime Context`
+    /// section containing both stable fields (Channel / Tools / Workspace /
+    /// Platform) and the day-granular `Today is:` line at the tail of the
+    /// section. The layered builder (`ContextBuilder::build_system_layered`)
+    /// uses `render_stable` and `render_volatile` instead so the volatile
+    /// line lands past the memory section in the final prompt.
+    ///
     /// # Example
     /// ```rust
     /// use zeptoclaw::agent::RuntimeContext;
@@ -227,14 +234,61 @@ impl RuntimeContext {
                 self.available_tools.join(", ")
             ));
         }
+        if let Some(ref workspace) = self.workspace {
+            parts.push(format!("- Workspace: {}", workspace));
+            parts.push(
+                "- Workspace path rules: filesystem tools are scoped here. Prefer relative paths like `.` or `dir/file`; do not invent host paths outside the configured workspace.".to_string(),
+            );
+        }
+        if let Some(ref os) = self.os_info {
+            parts.push(format!("- Platform: {}", os));
+        }
         // P0a: emit only the day-granular `Today is:` label. Minute-level
         // time and timezone offset are intentionally NOT emitted — they
         // would change every minute and invalidate the prompt-cache prefix
         // on every LLM call. Channel UIs already show message timestamps;
         // the model still has day-of-week awareness via this label.
+        //
+        // P3: in render() the Today line trails the stable fields so the
+        // single-section legacy callers still see one `## Runtime Context`
+        // block. The layered builder splits it out to L4.
         if self.timezone.is_some() {
             let now = Local::now();
             parts.push(format!("- Today is: {}", now.format("%A, %B %-d, %Y")));
+        }
+
+        Some(format!("## Runtime Context\n\n{}", parts.join("\n")))
+    }
+
+    /// Render only the **stable** portion of runtime context (L2 semi-static).
+    ///
+    /// Emits a `## Runtime Context` section with Channel + Available tools +
+    /// Workspace (and path rules) + Platform. **Excludes** the day-granular
+    /// `Today is:` line — that lives in `render_volatile` (L4) so the prompt
+    /// prefix can be shared across days as long as the layered prompt is
+    /// reassembled in L1→L2→L3→L4 order. See plan
+    /// `docs/plans/doing/2026-05-21-token-cost-optimization.md §6.4`.
+    ///
+    /// Returns `None` when no stable field is set (timezone alone does not
+    /// qualify this section as renderable; it only contributes to the
+    /// volatile section).
+    pub fn render_stable(&self) -> Option<String> {
+        let has_stable = self.channel.is_some()
+            || !self.available_tools.is_empty()
+            || self.workspace.is_some()
+            || self.os_info.is_some();
+        if !has_stable {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if let Some(ref channel) = self.channel {
+            parts.push(format!("- Channel: {}", channel));
+        }
+        if !self.available_tools.is_empty() {
+            parts.push(format!(
+                "- Available tools: {}",
+                self.available_tools.join(", ")
+            ));
         }
         if let Some(ref workspace) = self.workspace {
             parts.push(format!("- Workspace: {}", workspace));
@@ -245,8 +299,23 @@ impl RuntimeContext {
         if let Some(ref os) = self.os_info {
             parts.push(format!("- Platform: {}", os));
         }
-
         Some(format!("## Runtime Context\n\n{}", parts.join("\n")))
+    }
+
+    /// Render only the **volatile** portion of runtime context (L4).
+    ///
+    /// Emits a `## Session Now` section with the day-granular `Today is:`
+    /// line. Returns `None` when no timezone is configured.
+    ///
+    /// Day rollovers invalidate this section; placing it at the prompt tail
+    /// keeps the L1+L2+L3 prefix cacheable across the rollover.
+    pub fn render_volatile(&self) -> Option<String> {
+        self.timezone.as_ref()?;
+        let now = Local::now();
+        Some(format!(
+            "## Session Now\n\n- Today is: {}",
+            now.format("%A, %B %-d, %Y")
+        ))
     }
 }
 
@@ -264,6 +333,67 @@ impl PromptCapabilities {
     /// Convenience constructor for the A2UI-capable variant.
     pub fn with_a2ui() -> Self {
         Self { a2ui_capable: true }
+    }
+}
+
+/// Structured layered view of the system prompt for cache-aware assembly.
+///
+/// The four layers are concatenated in L1→L2→L3→L4 order with blank-line
+/// separators (`join`). Layout follows plan
+/// `docs/plans/doing/2026-05-21-token-cost-optimization.md §6.4`:
+///
+/// - **L1 `base_static`** — persona (SOUL), base system prompt, A2UI suffix
+///   when the channel can render A2UI surfaces. Static across the
+///   conversation; lives at the top of the prompt where prompt caches anchor.
+/// - **L2 `semi_static`** — Available Skills section and the stable runtime
+///   fields (Channel / Available tools / Workspace / Platform). These drift
+///   slowly (a skill enabled, a workspace renamed) so they sit just below
+///   the static layer.
+/// - **L3 `memory`** — long-term memory (pinned + recall). Tied to the user
+///   session; sits below the workspace fingerprint so memory churn doesn't
+///   invalidate the L1/L2 prefix.
+/// - **L4 `volatile`** — day-granular `Today is:` and any other per-turn
+///   volatile signals. Always tail of the prompt so a day rollover only
+///   shifts the suffix.
+///
+/// Used by `ContextBuilder::build_system_layered` and also returned to
+/// callers that want layer-level measurements (planned: P1.5
+/// `cache_baseline` token accounting).
+#[derive(Debug, Clone)]
+pub struct LayeredSystemPrompt {
+    /// L1: base static persona + system prompt + (optional) A2UI suffix.
+    /// Always populated; the system prompt itself is mandatory.
+    pub l1_base: String,
+    /// L2: semi-static (Skills + stable runtime context).
+    /// `None` when neither skills nor stable runtime fields are configured.
+    pub l2_semi_static: Option<String>,
+    /// L3: memory section, already pre-formatted with its own `## Memory`
+    /// heading by the caller. `None` when no memory context is configured.
+    pub l3_memory: Option<String>,
+    /// L4: per-turn volatile section (currently the day-granular `Today is:`
+    /// label, headed `## Session Now`). `None` when no timezone is set.
+    pub l4_volatile: Option<String>,
+}
+
+impl LayeredSystemPrompt {
+    /// Join the populated layers in L1→L2→L3→L4 order with blank-line
+    /// separators. Returns the full system-prompt string ready to attach to
+    /// a `Message::system`.
+    pub fn join(&self) -> String {
+        let mut s = self.l1_base.clone();
+        if let Some(ref l2) = self.l2_semi_static {
+            s.push_str("\n\n");
+            s.push_str(l2);
+        }
+        if let Some(ref l3) = self.l3_memory {
+            s.push_str("\n\n");
+            s.push_str(l3);
+        }
+        if let Some(ref l4) = self.l4_volatile {
+            s.push_str("\n\n");
+            s.push_str(l4);
+        }
+        s
     }
 }
 
@@ -460,27 +590,8 @@ impl ContextBuilder {
     /// assert_eq!(system.role, Role::System);
     /// ```
     pub fn build_system_message(&self) -> Message {
-        let mut content = String::new();
-        if let Some(ref soul) = self.soul_prompt {
-            content.push_str(soul);
-            content.push_str("\n\n");
-        }
-        content.push_str(&self.system_prompt);
-        if let Some(ref skills) = self.skills_prompt {
-            content.push_str("\n\n## Available Skills\n\n");
-            content.push_str(skills);
-        }
-        if let Some(ref ctx) = self.runtime_context {
-            if let Some(rendered) = ctx.render() {
-                content.push_str("\n\n");
-                content.push_str(&rendered);
-            }
-        }
-        if let Some(ref mem) = self.memory_context {
-            content.push_str("\n\n");
-            content.push_str(mem);
-        }
-        Message::system(&content)
+        let layered = self.build_system_layered(PromptCapabilities::default(), None);
+        Message::system(&layered.join())
     }
 
     /// Internal builder that supports both memory override and channel
@@ -491,38 +602,80 @@ impl ContextBuilder {
         memory_override: Option<&str>,
         caps: PromptCapabilities,
     ) -> Message {
-        let mut content = String::new();
+        let layered = self.build_system_layered(caps, memory_override);
+        Message::system(&layered.join())
+    }
+
+    /// Build the system prompt as a structured `LayeredSystemPrompt` so
+    /// callers (and metrics code) can reason about cache-friendly layers.
+    ///
+    /// Layer assignment follows plan
+    /// `docs/plans/doing/2026-05-21-token-cost-optimization.md §6.4`:
+    ///
+    /// - L1: SOUL (if any) + base `system_prompt` + A2UI suffix (when
+    ///   `caps.a2ui_capable`).
+    /// - L2: `## Available Skills` (if configured) and the stable runtime
+    ///   context fields (Channel / Available tools / Workspace / Platform).
+    ///   Excludes the `Today is:` line — that drifts daily so it belongs in
+    ///   L4 to keep the L1+L2+L3 prefix cacheable across day rollovers.
+    /// - L3: memory section (with optional per-call override; `Some("")`
+    ///   explicitly suppresses memory for this build).
+    /// - L4: the day-granular volatile runtime context (`## Session Now`).
+    ///
+    /// `LayeredSystemPrompt::join` concatenates the populated layers with
+    /// blank-line separators in L1→L2→L3→L4 order.
+    pub fn build_system_layered(
+        &self,
+        caps: PromptCapabilities,
+        memory_override: Option<&str>,
+    ) -> LayeredSystemPrompt {
+        // L1: persona + base + (optional) A2UI suffix.
+        let mut l1 = String::new();
         if let Some(ref soul) = self.soul_prompt {
-            content.push_str(soul);
-            content.push_str("\n\n");
+            l1.push_str(soul);
+            l1.push_str("\n\n");
         }
-        content.push_str(&self.system_prompt);
+        l1.push_str(&self.system_prompt);
         if caps.a2ui_capable {
-            content.push_str("\n\n");
-            content.push_str(A2UI_RENDERING_PROMPT_SUFFIX);
+            l1.push_str("\n\n");
+            l1.push_str(A2UI_RENDERING_PROMPT_SUFFIX);
         }
+
+        // L2: skills section + stable runtime context.
+        let mut l2_parts: Vec<String> = Vec::new();
         if let Some(ref skills) = self.skills_prompt {
-            content.push_str("\n\n## Available Skills\n\n");
-            content.push_str(skills);
+            l2_parts.push(format!("## Available Skills\n\n{}", skills));
         }
         if let Some(ref ctx) = self.runtime_context {
-            if let Some(rendered) = ctx.render() {
-                content.push_str("\n\n");
-                content.push_str(&rendered);
+            if let Some(stable) = ctx.render_stable() {
+                l2_parts.push(stable);
             }
         }
-
-        let memory = match memory_override {
-            Some("") => None,
-            Some(memory) => Some(memory),
-            None => self.memory_context.as_deref(),
+        let l2_semi_static = if l2_parts.is_empty() {
+            None
+        } else {
+            Some(l2_parts.join("\n\n"))
         };
-        if let Some(memory) = memory {
-            content.push_str("\n\n");
-            content.push_str(memory);
-        }
 
-        Message::system(&content)
+        // L3: memory section, with per-call override.
+        let l3_memory = match memory_override {
+            Some("") => None,
+            Some(memory) => Some(memory.to_string()),
+            None => self.memory_context.clone(),
+        };
+
+        // L4: day-granular volatile runtime context (Today is:).
+        let l4_volatile = self
+            .runtime_context
+            .as_ref()
+            .and_then(|c| c.render_volatile());
+
+        LayeredSystemPrompt {
+            l1_base: l1,
+            l2_semi_static,
+            l3_memory,
+            l4_volatile,
+        }
     }
 
     /// Build the full message list for an LLM call.
@@ -1052,6 +1205,203 @@ mod tests {
         let cloned = ctx.clone();
         assert_eq!(ctx.channel, cloned.channel);
         assert_eq!(ctx.workspace, cloned.workspace);
+    }
+
+    // ---- P3 layered prompt tests ----
+    //
+    // The split between `render_stable` (L2) and `render_volatile` (L4) is the
+    // structural enabler for prompt-cache hits across day rollovers. These
+    // tests pin the layer-membership contract.
+
+    #[test]
+    fn p3_render_stable_excludes_today_line() {
+        let ctx = RuntimeContext::new()
+            .with_channel("cli")
+            .with_tools(vec!["echo".to_string()])
+            .with_workspace("/work")
+            .with_timezone("UTC");
+        let stable = ctx
+            .render_stable()
+            .expect("stable section should render with channel/tools/workspace");
+        assert!(stable.starts_with("## Runtime Context"));
+        assert!(stable.contains("Channel: cli"));
+        assert!(stable.contains("Available tools: echo"));
+        assert!(stable.contains("Workspace: /work"));
+        assert!(
+            !stable.contains("Today is:"),
+            "stable section must NOT contain Today (cache-killer if reused across days): {}",
+            stable
+        );
+    }
+
+    #[test]
+    fn p3_render_stable_none_when_only_timezone() {
+        // Timezone alone is volatile-only signal; the stable section must
+        // collapse to None so the layered builder doesn't emit an empty
+        // `## Runtime Context` header.
+        let ctx = RuntimeContext::new().with_timezone("UTC");
+        assert!(ctx.render_stable().is_none());
+    }
+
+    #[test]
+    fn p3_render_volatile_only_emits_today_line() {
+        let ctx = RuntimeContext::new()
+            .with_channel("cli")
+            .with_workspace("/work")
+            .with_timezone("UTC");
+        let volatile = ctx
+            .render_volatile()
+            .expect("volatile should render when timezone is set");
+        assert!(volatile.starts_with("## Session Now"));
+        assert!(volatile.contains("Today is:"));
+        assert!(
+            !volatile.contains("Channel:"),
+            "volatile must NOT contain Channel (channel lives in L2 stable): {}",
+            volatile
+        );
+        assert!(
+            !volatile.contains("Workspace:"),
+            "volatile must NOT contain Workspace (workspace is L2 stable): {}",
+            volatile
+        );
+    }
+
+    #[test]
+    fn p3_render_volatile_none_without_timezone() {
+        let ctx = RuntimeContext::new()
+            .with_channel("cli")
+            .with_workspace("/work");
+        assert!(ctx.render_volatile().is_none());
+    }
+
+    #[test]
+    fn p3_layered_join_order_l1_l2_l3_l4() {
+        // Full layered prompt: SOUL → system → skills + stable runtime → memory → volatile.
+        let ctx = RuntimeContext::new()
+            .with_channel("cli")
+            .with_workspace("/work")
+            .with_timezone("UTC");
+        let builder = ContextBuilder::new()
+            .with_soul("SOUL_ANCHOR")
+            .with_skills("- /help: show help")
+            .with_runtime_context(ctx)
+            .with_memory_context("## Memory\n\n### Pinned\n- mem:anchor".to_string());
+        let layered = builder.build_system_layered(PromptCapabilities::default(), None);
+
+        // Each layer should be populated.
+        assert!(layered.l1_base.contains("SOUL_ANCHOR"));
+        assert!(layered.l1_base.contains("ZeptoClaw"));
+        let l2 = layered.l2_semi_static.as_ref().expect("L2 should exist");
+        assert!(l2.contains("## Available Skills"));
+        assert!(l2.contains("## Runtime Context"));
+        assert!(l2.contains("Channel: cli"));
+        assert!(l2.contains("Workspace: /work"));
+        assert!(!l2.contains("Today is:"));
+        let l3 = layered.l3_memory.as_ref().expect("L3 should exist");
+        assert!(l3.contains("mem:anchor"));
+        let l4 = layered.l4_volatile.as_ref().expect("L4 should exist");
+        assert!(l4.contains("Today is:"));
+
+        // Joined order must be L1→L2→L3→L4.
+        let joined = layered.join();
+        let soul_pos = joined.find("SOUL_ANCHOR").unwrap();
+        let skills_pos = joined.find("## Available Skills").unwrap();
+        let runtime_pos = joined.find("## Runtime Context").unwrap();
+        let memory_pos = joined.find("## Memory").unwrap();
+        let today_pos = joined.find("Today is:").unwrap();
+        assert!(soul_pos < skills_pos, "SOUL before Skills");
+        assert!(skills_pos < runtime_pos, "Skills before Runtime Context");
+        assert!(runtime_pos < memory_pos, "Runtime Context before Memory");
+        assert!(memory_pos < today_pos, "Memory before Today is: (P3 core invariant)");
+    }
+
+    #[test]
+    fn p3_built_system_message_places_today_after_memory() {
+        // Behavioral test against the legacy entry point used by the agent
+        // loop. Today must trail Memory in the final system prompt string so
+        // a day rollover doesn't invalidate the prefix.
+        let ctx = RuntimeContext::new()
+            .with_channel("discord")
+            .with_timezone("Asia/Kuala_Lumpur");
+        let builder = ContextBuilder::new()
+            .with_runtime_context(ctx)
+            .with_memory_context("## Memory\n\n### Pinned\n- k: v".to_string());
+        let system = builder.build_system_message();
+        let memory_pos = system.content.find("## Memory").unwrap();
+        let today_pos = system.content.find("Today is:").unwrap();
+        assert!(
+            memory_pos < today_pos,
+            "P3 invariant: Today is: must come AFTER memory section. \
+             memory_pos={} today_pos={} content=\n{}",
+            memory_pos,
+            today_pos,
+            system.content
+        );
+    }
+
+    #[test]
+    fn p3_built_system_message_no_today_in_stable_runtime_block() {
+        // Tighter contract: within the `## Runtime Context` section (stable
+        // L2), there must be no `Today is:` line. We bound the search to the
+        // region between `## Runtime Context` and the next blank-line section
+        // header.
+        let ctx = RuntimeContext::new()
+            .with_channel("cli")
+            .with_workspace("/work")
+            .with_timezone("UTC");
+        let builder = ContextBuilder::new().with_runtime_context(ctx);
+        let system = builder.build_system_message();
+        let rc_start = system.content.find("## Runtime Context").unwrap();
+        // Slice from the runtime context heading to the next section heading.
+        let tail = &system.content[rc_start..];
+        let rc_end = tail[1..]
+            .find("\n## ")
+            .map(|p| rc_start + 1 + p)
+            .unwrap_or(system.content.len());
+        let runtime_block = &system.content[rc_start..rc_end];
+        assert!(
+            !runtime_block.contains("Today is:"),
+            "stable L2 Runtime Context block must NOT contain Today is:. \
+             block=\n{}",
+            runtime_block
+        );
+    }
+
+    #[test]
+    fn p3_layered_optional_layers_collapse_cleanly() {
+        // Only the base + system prompt should be present; no L2/L3/L4.
+        let builder = ContextBuilder::new();
+        let layered = builder.build_system_layered(PromptCapabilities::default(), None);
+        assert!(layered.l1_base.contains("ZeptoClaw"));
+        assert!(layered.l2_semi_static.is_none());
+        assert!(layered.l3_memory.is_none());
+        assert!(layered.l4_volatile.is_none());
+        // join() should not introduce trailing whitespace from absent layers.
+        let joined = layered.join();
+        assert_eq!(joined.trim_end(), joined);
+    }
+
+    #[test]
+    fn p3_layered_memory_override_empty_suppresses_l3() {
+        let builder = ContextBuilder::new()
+            .with_memory_context("## Memory\n\n- stored".to_string());
+        let layered = builder.build_system_layered(PromptCapabilities::default(), Some(""));
+        assert!(
+            layered.l3_memory.is_none(),
+            "Some(\"\") override must collapse L3 to None"
+        );
+    }
+
+    #[test]
+    fn p3_layered_a2ui_lives_in_l1() {
+        // When the channel is A2UI-capable, the A2UI rendering suffix is
+        // part of the static L1 layer (it does not drift per turn).
+        let builder = ContextBuilder::new();
+        let layered = builder.build_system_layered(PromptCapabilities::with_a2ui(), None);
+        assert!(
+            layered.l1_base.contains("A2UI"),
+            "L1 should carry A2UI suffix when channel is A2UI-capable"
+        );
     }
 
     // ---- Message envelope tests ----
