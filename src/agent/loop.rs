@@ -37,7 +37,9 @@ use crate::utils::metrics::MetricsCollector;
 use super::budget::TokenBudget;
 use super::context::{ContextBuilder, PromptCapabilities};
 use super::tool_call_limit::ToolCallLimitTracker;
-use super::turn::{classify_final_content, StreamingMarkupGuard, TurnOutcome};
+use super::turn::{
+    classify_final_content, classify_synthesis_trigger, StreamingMarkupGuard, TurnOutcome,
+};
 
 /// System prompt sent during the memory flush turn, instructing the LLM to
 /// persist important facts and deduplicate existing long-term memory entries.
@@ -2953,10 +2955,11 @@ impl AgentLoop {
             }
         }
 
-        if iteration >= max_iterations && response.has_tool_calls() {
+        let max_iter_reached = iteration >= max_iterations && response.has_tool_calls();
+        if max_iter_reached {
             info!(
                 iterations = iteration,
-                "Tool loop reached maximum iterations, returning partial response"
+                "Tool loop reached maximum iterations, attempting final synthesis"
             );
         }
 
@@ -2969,14 +2972,75 @@ impl AgentLoop {
             });
         }
 
-        // Phase 1 state-machine refactor: classify final content explicitly
-        // instead of treating `!response.has_tool_calls()` as a synonym for
-        // "successful answer". Even when max_iterations was reached with
-        // tool calls still pending, the user-visible outcome is determined
-        // solely by `response.content` (no more tools will run this turn).
-        // Empty or provider-markup-only content returns an explicit error;
-        // retry / synthesis behaviour is deferred to phase 2.
-        match classify_final_content(&response.content) {
+        // Phase 1: classify the raw final content. ToolCalls cannot occur
+        // here (classify_final_content does not return that variant) so we
+        // only need to look at content shape.
+        let initial_outcome = classify_final_content(&response.content);
+        let cfg_defaults = &self.config.agents.defaults;
+        let synthesis_trigger = classify_synthesis_trigger(
+            &initial_outcome,
+            max_iter_reached,
+            cfg_defaults.final_synthesis_on_empty,
+            cfg_defaults.final_synthesis_on_tool_limit,
+        );
+
+        // Phase 2: when the loop produces no usable answer but synthesis is
+        // enabled, run one tools-disabled synthesis turn before deciding
+        // the final outcome. The synthesis result is itself classified, so
+        // an empty / markup-only synthesis response still fails explicitly.
+        let outcome = if let Some(trigger) = synthesis_trigger {
+            let provider_opt = self
+                .provider
+                .read()
+                .await
+                .as_ref()
+                .map(Arc::clone);
+            match provider_opt {
+                Some(provider) => {
+                    info!(
+                        trigger = trigger,
+                        iterations = iteration,
+                        "agent_turn: running final synthesis"
+                    );
+                    let synthesis_messages = self
+                        .build_resolved_messages(msg, &session, memory_override.as_deref())
+                        .await;
+                    let chat_options = ChatOptions::new()
+                        .with_max_tokens(cfg_defaults.max_tokens)
+                        .with_temperature(cfg_defaults.temperature);
+                    let model = Some(cfg_defaults.model.clone());
+                    match crate::agent::synthesis::run_final_synthesis(
+                        provider,
+                        synthesis_messages,
+                        model,
+                        chat_options,
+                    )
+                    .await
+                    {
+                        Ok(resp) => classify_final_content(&resp.content),
+                        Err(e) => {
+                            warn!(
+                                trigger = trigger,
+                                error = %e,
+                                "agent_turn: final synthesis call failed; falling back to initial outcome"
+                            );
+                            initial_outcome
+                        }
+                    }
+                }
+                None => {
+                    warn!(
+                        trigger = trigger,
+                        "agent_turn: final synthesis configured but no provider attached; falling back to initial outcome"
+                    );
+                    initial_outcome
+                }
+            }
+        } else {
+            initial_outcome
+        };
+
+        match outcome {
             TurnOutcome::FinalAnswer(text) => {
                 session.add_message(Message::assistant(&text));
                 self.session_manager.save(&session).await?;
@@ -2986,7 +3050,7 @@ impl AgentLoop {
                 warn!(
                     iterations = iteration,
                     tool_call_count = response.tool_calls.len(),
-                    "agent_turn: empty final answer (phase 1: returning explicit error)"
+                    "agent_turn: empty final answer after synthesis attempt"
                 );
                 Err(ZeptoError::Provider(
                     "模型返回了空白最终答案。请重试或缩小任务范围。".to_string(),
@@ -2995,7 +3059,7 @@ impl AgentLoop {
             TurnOutcome::ProviderMarkupOnly => {
                 warn!(
                     iterations = iteration,
-                    "agent_turn: provider tool markup leaked into final content (phase 1: returning explicit error)"
+                    "agent_turn: provider tool markup leaked into final content after synthesis attempt"
                 );
                 Err(ZeptoError::Provider(
                     "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。"
@@ -3959,6 +4023,19 @@ impl AgentLoop {
                 });
             }
 
+            // Phase 2 state-machine refactor: clone synthesis pre-requisites
+            // so the spawned forwarder task can invoke `run_final_synthesis`
+            // without holding `&self`. Clones are taken here, before
+            // `messages` / `options` are moved into `chat_stream`, so the
+            // synthesis call sees exactly the same context as the final
+            // streaming call.
+            let synthesis_provider = Arc::clone(&provider);
+            let synthesis_messages = messages.clone();
+            let synthesis_model = model.map(str::to_string);
+            let synthesis_options = options.clone();
+            let synthesis_on_empty =
+                self.config.agents.defaults.final_synthesis_on_empty;
+
             let stream_rx = provider
                 .chat_stream(messages, tool_definitions, model, options)
                 .await?;
@@ -4002,11 +4079,13 @@ impl AgentLoop {
                             // Classify the streamed final content. Only
                             // FinalAnswer is persisted to the session and
                             // forwarded as Done. Empty / provider-markup-only
-                            // payloads are surfaced as StreamEvent::Error
-                            // so the channel layer can show a meaningful
-                            // message instead of an empty assistant turn.
+                            // payloads optionally trigger one tools-disabled
+                            // synthesis turn (phase 2); on success its
+                            // output is flushed as a single Delta + Done,
+                            // otherwise the channel sees StreamEvent::Error.
                             let content_len = content.len();
-                            match classify_final_content(&content) {
+                            let outcome = classify_final_content(&content);
+                            match outcome {
                                 TurnOutcome::FinalAnswer(_) => {
                                     // Flush any content the guard withheld
                                     // because it started with `<`. The
@@ -4025,33 +4104,99 @@ impl AgentLoop {
                                         .send(StreamEvent::Done { content, usage })
                                         .await;
                                 }
-                                TurnOutcome::EmptyAnswer => {
-                                    tracing::warn!(
-                                        content_len,
-                                        "agent_turn(streaming): empty final answer (phase 1: returning explicit error)"
-                                    );
-                                    let _ = out_tx
-                                        .send(StreamEvent::Error(ZeptoError::Provider(
-                                            "模型返回了空白最终答案。请重试或缩小任务范围。"
-                                                .to_string(),
-                                        )))
-                                        .await;
-                                }
-                                TurnOutcome::ProviderMarkupOnly => {
-                                    tracing::warn!(
-                                        content_len,
-                                        buffered = markup_guard.is_buffering(),
-                                        "agent_turn(streaming): provider tool markup leaked into final content (phase 1: returning explicit error)"
-                                    );
-                                    // Buffered markup is deliberately
-                                    // dropped on the floor: this is exactly
-                                    // the case the guard exists to suppress.
-                                    let _ = out_tx
-                                        .send(StreamEvent::Error(ZeptoError::Provider(
-                                            "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。"
-                                                .to_string(),
-                                        )))
-                                        .await;
+                                bad_outcome @ (TurnOutcome::EmptyAnswer
+                                | TurnOutcome::ProviderMarkupOnly) => {
+                                    let (reason, user_error_msg) = match bad_outcome {
+                                        TurnOutcome::EmptyAnswer => (
+                                            "empty_answer",
+                                            "模型返回了空白最终答案。请重试或缩小任务范围。",
+                                        ),
+                                        TurnOutcome::ProviderMarkupOnly => (
+                                            "provider_markup",
+                                            "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。",
+                                        ),
+                                        _ => unreachable!(),
+                                    };
+                                    if synthesis_on_empty {
+                                        tracing::warn!(
+                                            content_len,
+                                            buffered = markup_guard.is_buffering(),
+                                            reason,
+                                            "agent_turn(streaming): final content unusable, running synthesis"
+                                        );
+                                        match crate::agent::synthesis::run_final_synthesis(
+                                            synthesis_provider,
+                                            synthesis_messages,
+                                            synthesis_model,
+                                            synthesis_options,
+                                        )
+                                        .await
+                                        {
+                                            Ok(synth_resp) => match classify_final_content(
+                                                &synth_resp.content,
+                                            ) {
+                                                TurnOutcome::FinalAnswer(synth_text) => {
+                                                    session.add_message(Message::assistant(
+                                                        &synth_text,
+                                                    ));
+                                                    let _ = session_manager
+                                                        .save(&session)
+                                                        .await;
+                                                    let synth_clone = synth_text.clone();
+                                                    let _ = out_tx
+                                                        .send(StreamEvent::Delta(synth_text))
+                                                        .await;
+                                                    let _ = out_tx
+                                                        .send(StreamEvent::Done {
+                                                            content: synth_clone,
+                                                            usage: synth_resp.usage,
+                                                        })
+                                                        .await;
+                                                }
+                                                TurnOutcome::EmptyAnswer
+                                                | TurnOutcome::ProviderMarkupOnly => {
+                                                    tracing::warn!(
+                                                        reason,
+                                                        "agent_turn(streaming): synthesis also produced unusable answer"
+                                                    );
+                                                    let _ = out_tx
+                                                        .send(StreamEvent::Error(
+                                                            ZeptoError::Provider(
+                                                                user_error_msg.to_string(),
+                                                            ),
+                                                        ))
+                                                        .await;
+                                                }
+                                                TurnOutcome::ToolCalls(_) => unreachable!(),
+                                            },
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    reason,
+                                                    error = %e,
+                                                    "agent_turn(streaming): synthesis call failed"
+                                                );
+                                                let _ = out_tx
+                                                    .send(StreamEvent::Error(
+                                                        ZeptoError::Provider(
+                                                            user_error_msg.to_string(),
+                                                        ),
+                                                    ))
+                                                    .await;
+                                            }
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            content_len,
+                                            buffered = markup_guard.is_buffering(),
+                                            reason,
+                                            "agent_turn(streaming): final content unusable, synthesis disabled"
+                                        );
+                                        let _ = out_tx
+                                            .send(StreamEvent::Error(ZeptoError::Provider(
+                                                user_error_msg.to_string(),
+                                            )))
+                                            .await;
+                                    }
                                 }
                                 TurnOutcome::ToolCalls(_) => unreachable!(
                                     "classify_final_content cannot return ToolCalls"
@@ -4092,27 +4237,70 @@ impl AgentLoop {
 
             Ok(out_rx)
         } else {
-            // Still has tool calls after max iterations — return non-streaming result.
-            //
-            // Phase 1 state-machine refactor: classify response.content so
-            // empty / provider-markup-only payloads surface as
-            // StreamEvent::Error instead of an empty Done event.
+            // Still has tool calls after max iterations — no `chat_stream`
+            // call was issued; the user-visible payload is whatever the
+            // tool-loop response contained. Phase 2: attempt one
+            // tools-disabled synthesis turn before failing.
             let (tx, rx) = tokio::sync::mpsc::channel(1);
-            match classify_final_content(&response.content) {
+            let cfg_defaults = &self.config.agents.defaults;
+            let initial_outcome = classify_final_content(&response.content);
+            let trigger = classify_synthesis_trigger(
+                &initial_outcome,
+                true,
+                cfg_defaults.final_synthesis_on_empty,
+                cfg_defaults.final_synthesis_on_tool_limit,
+            );
+
+            let (outcome, done_usage) = if let Some(label) = trigger {
+                info!(
+                    trigger = label,
+                    tool_call_count = response.tool_calls.len(),
+                    "agent_turn(streaming): running final synthesis at max iter"
+                );
+                let synth_messages = self
+                    .build_resolved_messages(msg, &session, memory_override.as_deref())
+                    .await;
+                let synth_options = ChatOptions::new()
+                    .with_max_tokens(cfg_defaults.max_tokens)
+                    .with_temperature(cfg_defaults.temperature);
+                let synth_model = Some(cfg_defaults.model.clone());
+                match crate::agent::synthesis::run_final_synthesis(
+                    Arc::clone(&provider),
+                    synth_messages,
+                    synth_model,
+                    synth_options,
+                )
+                .await
+                {
+                    Ok(resp) => (classify_final_content(&resp.content), resp.usage),
+                    Err(e) => {
+                        warn!(
+                            trigger = label,
+                            error = %e,
+                            "agent_turn(streaming): synthesis at max iter failed; falling back"
+                        );
+                        (initial_outcome, response.usage.clone())
+                    }
+                }
+            } else {
+                (initial_outcome, response.usage.clone())
+            };
+
+            match outcome {
                 TurnOutcome::FinalAnswer(text) => {
                     session.add_message(Message::assistant(&text));
                     self.session_manager.save(&session).await?;
                     let _ = tx
                         .send(StreamEvent::Done {
                             content: text,
-                            usage: response.usage,
+                            usage: done_usage,
                         })
                         .await;
                 }
                 TurnOutcome::EmptyAnswer => {
                     warn!(
                         tool_call_count = response.tool_calls.len(),
-                        "agent_turn(streaming): empty final answer at max iterations (phase 1: returning explicit error)"
+                        "agent_turn(streaming): empty final answer at max iter after synthesis attempt"
                     );
                     let _ = tx
                         .send(StreamEvent::Error(ZeptoError::Provider(
@@ -4122,7 +4310,7 @@ impl AgentLoop {
                 }
                 TurnOutcome::ProviderMarkupOnly => {
                     warn!(
-                        "agent_turn(streaming): provider tool markup leaked at max iterations (phase 1: returning explicit error)"
+                        "agent_turn(streaming): provider tool markup at max iter after synthesis attempt"
                     );
                     let _ = tx
                         .send(StreamEvent::Error(ZeptoError::Provider(

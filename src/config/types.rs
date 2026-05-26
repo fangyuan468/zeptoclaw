@@ -775,6 +775,21 @@ pub struct AgentDefaults {
     /// mode where the system prompt must come from config, not CLI flags.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// State-machine refactor phase 2: when the tool loop finishes with an
+    /// empty / provider-markup-only final answer, run one tools-disabled
+    /// synthesis turn before failing the request. Default: enabled.
+    #[serde(default = "default_final_synthesis_enabled")]
+    pub final_synthesis_on_empty: bool,
+    /// State-machine refactor phase 2: when the tool loop is cut off at
+    /// `max_tool_iterations` while the model still wants more tool calls,
+    /// run one tools-disabled synthesis turn before returning. Default:
+    /// enabled.
+    #[serde(default = "default_final_synthesis_enabled")]
+    pub final_synthesis_on_tool_limit: bool,
+}
+
+fn default_final_synthesis_enabled() -> bool {
+    true
 }
 
 /// Detect the system's IANA timezone.
@@ -831,6 +846,8 @@ impl Default for AgentDefaults {
             max_tool_result_bytes: default_max_tool_result_bytes(),
             max_tool_calls: None,
             system_prompt: None,
+            final_synthesis_on_empty: default_final_synthesis_enabled(),
+            final_synthesis_on_tool_limit: default_final_synthesis_enabled(),
         }
     }
 }
