@@ -37,6 +37,7 @@ use crate::utils::metrics::MetricsCollector;
 use super::budget::TokenBudget;
 use super::context::{ContextBuilder, PromptCapabilities};
 use super::tool_call_limit::ToolCallLimitTracker;
+use super::observations::{ToolObservation, ToolObservationKind};
 use super::turn::{
     classify_final_content, classify_synthesis_trigger, StreamingMarkupGuard, TurnOutcome,
 };
@@ -2377,7 +2378,15 @@ impl AgentLoop {
                                 if let Some(metrics) = usage_metrics.as_ref() {
                                     metrics.record_tool_validation_failure();
                                 }
-                                return (id, output.for_llm, false);
+                                // Lazy-schema validation rejected the args
+                                // before the tool ran; treat as a soft
+                                // error so the model can rewrite the call.
+                                return ToolObservation::pre_execution(
+                                    id,
+                                    name,
+                                    output.for_llm,
+                                    ToolObservationKind::SoftError,
+                                );
                             }
                             if name == "get_tool_schema" {
                                 if let Some(metrics) = usage_metrics.as_ref() {
@@ -2392,7 +2401,12 @@ impl AgentLoop {
                         if let crate::hooks::HookResult::Block(msg) =
                             hooks.before_tool(&name, &args, channel_name, chat_id)
                         {
-                            return (id, format!("Tool '{}' blocked by hook: {}", name, msg), false);
+                            return ToolObservation::pre_execution(
+                                id,
+                                name.clone(),
+                                format!("Tool '{}' blocked by hook: {}", name, msg),
+                                ToolObservationKind::HardError,
+                            );
                         }
 
                         // Agent mode enforcement (before approval gate).
@@ -2409,20 +2423,30 @@ impl AgentLoop {
                                 match mode_policy.check(tool_category) {
                                     crate::security::CategoryPermission::Blocked => {
                                         info!(tool = %name, mode = %agent_mode, category = ?tool_category, "Tool blocked by agent mode");
-                                        return (id, format!(
-                                            "Tool '{}' is blocked in {} mode (category: {})",
-                                            name, agent_mode, tool_category
-                                        ), false);
+                                        return ToolObservation::pre_execution(
+                                            id,
+                                            name.clone(),
+                                            format!(
+                                                "Tool '{}' is blocked in {} mode (category: {})",
+                                                name, agent_mode, tool_category
+                                            ),
+                                            ToolObservationKind::HardError,
+                                        );
                                     }
                                     crate::security::CategoryPermission::RequiresApproval => {
                                         if trusted_local_session {
                                             info!(tool = %name, mode = %agent_mode, category = ?tool_category, "Trusted local session bypassed approval-gated tool");
                                         } else if !gate.requires_approval(&name) {
                                             info!(tool = %name, mode = %agent_mode, category = ?tool_category, "Tool requires approval per agent mode");
-                                            return (id, format!(
-                                                "Tool '{}' requires approval in {} mode (category: {}). Not executed.",
-                                                name, agent_mode, tool_category
-                                            ), false);
+                                            return ToolObservation::pre_execution(
+                                                id,
+                                                name.clone(),
+                                                format!(
+                                                    "Tool '{}' requires approval in {} mode (category: {}). Not executed.",
+                                                    name, agent_mode, tool_category
+                                                ),
+                                                ToolObservationKind::ApprovalRequired,
+                                            );
                                         }
                                         // Fall through to approval gate — it will prompt for approval
                                     }
@@ -2445,13 +2469,23 @@ impl AgentLoop {
                             .await
                             {
                                 info!(tool = %name, "Tool requires approval, blocking execution");
-                                return (id, message, false);
+                                return ToolObservation::pre_execution(
+                                    id,
+                                    name,
+                                    message,
+                                    ToolObservationKind::ApprovalRequired,
+                                );
                             }
                         }
 
                         // Dry-run mode: describe what would happen without executing
                         if dry_run {
-                            return (id, Self::dry_run_result(&name, &args, &raw_args, budget), false);
+                            return ToolObservation::pre_execution(
+                                id,
+                                name.clone(),
+                                Self::dry_run_result(&name, &args, &raw_args, budget),
+                                ToolObservationKind::Success,
+                            );
                         }
                         let file_artifact_candidate =
                             prepare_file_artifact_candidate(&name, &args, &ctx);
@@ -2494,24 +2528,63 @@ impl AgentLoop {
                             .await
                         })
                         .catch_unwind();
-                        let (result, success, tool_output) = match tokio::time::timeout(tool_timeout, execution).await {
-                            Ok(Ok(Ok(output))) => {
-                                let success = !output.is_error;
-                                let for_llm = output.for_llm.clone();
-                                (for_llm, success, Some(output))
-                            }
-                            Ok(Ok(Err(e))) => {
-                                (format!("Error: {}", e), false, None)
-                            }
-                            Ok(Err(_panic)) => {
-                                error!(tool = %name, "Tool panicked during execution");
-                                (format!("Error: Tool '{}' panicked during execution", name), false, None)
-                            }
-                            Err(_) => {
-                                error!(tool = %name, timeout_secs = tool_timeout.as_secs(), "Tool execution timed out");
-                                (format!("Error: Tool '{}' timed out after {}s", name, tool_timeout.as_secs()), false, None)
-                            }
-                        };
+                        // Phase 3 state-machine refactor: classify execution
+                        // outcome into a `ToolObservationKind`.
+                        //   - Success         : tool ran, `is_error == false`.
+                        //   - SoftError       : tool ran, `is_error == true`
+                        //                       (e.g. web_fetch 404 — model
+                        //                       can recover from the in-band
+                        //                       message).
+                        //   - HardError       : `execute_tool` returned Err,
+                        //                       panic, or timeout.
+                        // `success` is kept as a derived bool so the rest of
+                        // the closure's hook / event / metrics branches
+                        // remain a 2-state decision; `kind` is what the
+                        // outer loop reads.
+                        let (result, success, tool_output, kind) =
+                            match tokio::time::timeout(tool_timeout, execution).await {
+                                Ok(Ok(Ok(output))) => {
+                                    let is_err = output.is_error;
+                                    let kind = if is_err {
+                                        ToolObservationKind::SoftError
+                                    } else {
+                                        ToolObservationKind::Success
+                                    };
+                                    let for_llm = output.for_llm.clone();
+                                    (for_llm, !is_err, Some(output), kind)
+                                }
+                                Ok(Ok(Err(e))) => (
+                                    format!("Error: {}", e),
+                                    false,
+                                    None,
+                                    ToolObservationKind::HardError,
+                                ),
+                                Ok(Err(_panic)) => {
+                                    error!(tool = %name, "Tool panicked during execution");
+                                    (
+                                        format!(
+                                            "Error: Tool '{}' panicked during execution",
+                                            name
+                                        ),
+                                        false,
+                                        None,
+                                        ToolObservationKind::HardError,
+                                    )
+                                }
+                                Err(_) => {
+                                    error!(tool = %name, timeout_secs = tool_timeout.as_secs(), "Tool execution timed out");
+                                    (
+                                        format!(
+                                            "Error: Tool '{}' timed out after {}s",
+                                            name,
+                                            tool_timeout.as_secs()
+                                        ),
+                                        false,
+                                        None,
+                                        ToolObservationKind::HardError,
+                                    )
+                                }
+                            };
 
                         let pause = tool_output.as_ref().is_some_and(|o| o.pause_for_input);
                         let elapsed = tool_start.elapsed();
@@ -2615,7 +2688,14 @@ impl AgentLoop {
                             }
                         }
 
-                        (id, sanitized_result, pause)
+                        ToolObservation::new(
+                            id,
+                            name,
+                            sanitized_result,
+                            kind,
+                            latency_ms,
+                            pause,
+                        )
                     }
                 })
                 .collect();
@@ -2638,10 +2718,10 @@ impl AgentLoop {
                 .collect();
             chain_tracker.record(&tool_names);
 
-            let results: Vec<(String, String, bool)> = results;
-            let should_pause = results.iter().any(|(_, _, pause)| *pause);
-            for (id, result, _) in &results {
-                session.add_message(Message::tool_result(id, result));
+            let results: Vec<ToolObservation> = results;
+            let should_pause = results.iter().any(|obs| obs.pause_for_input);
+            for obs in &results {
+                session.add_message(Message::tool_result(&obs.call_id, &obs.content));
             }
 
             // In-loop compaction: check if tool results pushed context over threshold
@@ -2789,7 +2869,7 @@ impl AgentLoop {
                 // Record outcomes for outcome-aware blocking.
                 let results_for_guard: Vec<(String, String)> = results
                     .iter()
-                    .map(|(id, r, _)| (id.clone(), r.clone()))
+                    .map(|obs| (obs.call_id.clone(), obs.content.clone()))
                     .collect();
                 if check_loop_guard_outcomes(
                     guard,
@@ -3508,7 +3588,12 @@ impl AgentLoop {
                                 if let Some(metrics) = usage_metrics.as_ref() {
                                     metrics.record_tool_validation_failure();
                                 }
-                                return (id, output.for_llm, false);
+                                return ToolObservation::pre_execution(
+                                    id,
+                                    name,
+                                    output.for_llm,
+                                    ToolObservationKind::SoftError,
+                                );
                             }
                             if name == "get_tool_schema" {
                                 if let Some(metrics) = usage_metrics.as_ref() {
@@ -3522,7 +3607,12 @@ impl AgentLoop {
                         if let crate::hooks::HookResult::Block(msg) =
                             hooks.before_tool(&name, &args, channel_name, chat_id)
                         {
-                            return (id, format!("Tool '{}' blocked by hook: {}", name, msg), false);
+                            return ToolObservation::pre_execution(
+                                id,
+                                name.clone(),
+                                format!("Tool '{}' blocked by hook: {}", name, msg),
+                                ToolObservationKind::HardError,
+                            );
                         }
 
                         // Agent mode enforcement — same fail-closed logic as non-streaming path.
@@ -3534,20 +3624,30 @@ impl AgentLoop {
                                 match mode_policy.check(tool_category) {
                                     crate::security::CategoryPermission::Blocked => {
                                         info!(tool = %name, mode = %agent_mode, category = ?tool_category, "Tool blocked by agent mode");
-                                        return (id, format!(
-                                            "Tool '{}' is blocked in {} mode (category: {})",
-                                            name, agent_mode, tool_category
-                                        ), false);
+                                        return ToolObservation::pre_execution(
+                                            id,
+                                            name.clone(),
+                                            format!(
+                                                "Tool '{}' is blocked in {} mode (category: {})",
+                                                name, agent_mode, tool_category
+                                            ),
+                                            ToolObservationKind::HardError,
+                                        );
                                     }
                                     crate::security::CategoryPermission::RequiresApproval => {
                                         if trusted_local_session {
                                             info!(tool = %name, mode = %agent_mode, category = ?tool_category, "Trusted local session bypassed approval-gated tool");
                                         } else if !gate.requires_approval(&name) {
                                             info!(tool = %name, mode = %agent_mode, category = ?tool_category, "Tool requires approval per agent mode");
-                                            return (id, format!(
-                                                "Tool '{}' requires approval in {} mode (category: {}). Not executed.",
-                                                name, agent_mode, tool_category
-                                            ), false);
+                                            return ToolObservation::pre_execution(
+                                                id,
+                                                name.clone(),
+                                                format!(
+                                                    "Tool '{}' requires approval in {} mode (category: {}). Not executed.",
+                                                    name, agent_mode, tool_category
+                                                ),
+                                                ToolObservationKind::ApprovalRequired,
+                                            );
                                         }
                                     }
                                     crate::security::CategoryPermission::Allowed => {}
@@ -3569,13 +3669,23 @@ impl AgentLoop {
                             .await
                             {
                                 info!(tool = %name, "Tool requires approval, blocking execution");
-                                return (id, message, false);
+                                return ToolObservation::pre_execution(
+                                    id,
+                                    name,
+                                    message,
+                                    ToolObservationKind::ApprovalRequired,
+                                );
                             }
                         }
 
                         // Dry-run mode: describe what would happen without executing
                         if dry_run {
-                            return (id, Self::dry_run_result(&name, &args, &raw_args, budget), false);
+                            return ToolObservation::pre_execution(
+                                id,
+                                name.clone(),
+                                Self::dry_run_result(&name, &args, &raw_args, budget),
+                                ToolObservationKind::Success,
+                            );
                         }
                         let file_artifact_candidate =
                             prepare_file_artifact_candidate(&name, &args, &ctx);
@@ -3618,20 +3728,50 @@ impl AgentLoop {
                             .await
                         })
                         .catch_unwind();
-                        let (result, success, tool_output) = match tokio::time::timeout(tool_timeout, execution).await {
-                            Ok(Ok(Ok(output))) => {
-                                let success = !output.is_error;
-                                let for_llm = output.for_llm.clone();
-                                (for_llm, success, Some(output))
-                            }
-                            Ok(Ok(Err(e))) => (format!("Error: {}", e), false, None),
-                            Ok(Err(_panic)) => {
-                                error!(tool = %name, "Tool panicked during execution");
-                                (format!("Error: Tool '{}' panicked during execution", name), false, None)
-                            }
-                            Err(_) => {
-                                error!(tool = %name, timeout_secs = tool_timeout.as_secs(), "Tool execution timed out");
-                                (format!("Error: Tool '{}' timed out after {}s", name, tool_timeout.as_secs()), false, None)
+                        // Phase 3: classify execution outcome — same
+                        // mapping as the non-streaming closure.
+                        let (result, success, tool_output, kind) =
+                            match tokio::time::timeout(tool_timeout, execution).await {
+                                Ok(Ok(Ok(output))) => {
+                                    let is_err = output.is_error;
+                                    let kind = if is_err {
+                                        ToolObservationKind::SoftError
+                                    } else {
+                                        ToolObservationKind::Success
+                                    };
+                                    let for_llm = output.for_llm.clone();
+                                    (for_llm, !is_err, Some(output), kind)
+                                }
+                                Ok(Ok(Err(e))) => (
+                                    format!("Error: {}", e),
+                                    false,
+                                    None,
+                                    ToolObservationKind::HardError,
+                                ),
+                                Ok(Err(_panic)) => {
+                                    error!(tool = %name, "Tool panicked during execution");
+                                    (
+                                        format!(
+                                            "Error: Tool '{}' panicked during execution",
+                                            name
+                                        ),
+                                        false,
+                                        None,
+                                        ToolObservationKind::HardError,
+                                    )
+                                }
+                                Err(_) => {
+                                    error!(tool = %name, timeout_secs = tool_timeout.as_secs(), "Tool execution timed out");
+                                    (
+                                        format!(
+                                            "Error: Tool '{}' timed out after {}s",
+                                            name,
+                                            tool_timeout.as_secs()
+                                        ),
+                                        false,
+                                        None,
+                                        ToolObservationKind::HardError,
+                                    )
                             }
                         };
                         let pause = tool_output.as_ref().is_some_and(|o| o.pause_for_input);
@@ -3737,7 +3877,14 @@ impl AgentLoop {
                                 });
                             }
                         }
-                        (id, sanitized_result, pause)
+                        ToolObservation::new(
+                            id,
+                            name,
+                            sanitized_result,
+                            kind,
+                            latency_ms,
+                            pause,
+                        )
                     }
                 })
                 .collect();
@@ -3759,10 +3906,10 @@ impl AgentLoop {
                 .map(|tc| tc.name.clone())
                 .collect();
             chain_tracker.record(&tool_names);
-            let results: Vec<(String, String, bool)> = results;
-            let should_pause = results.iter().any(|(_, _, pause)| *pause);
-            for (id, result, _) in &results {
-                session.add_message(Message::tool_result(id, result));
+            let results: Vec<ToolObservation> = results;
+            let should_pause = results.iter().any(|obs| obs.pause_for_input);
+            for obs in &results {
+                session.add_message(Message::tool_result(&obs.call_id, &obs.content));
             }
 
             // In-loop compaction: check if tool results pushed context over threshold
@@ -3822,7 +3969,7 @@ impl AgentLoop {
                 // Record outcomes for outcome-aware blocking.
                 let results_for_guard: Vec<(String, String)> = results
                     .iter()
-                    .map(|(id, r, _)| (id.clone(), r.clone()))
+                    .map(|obs| (obs.call_id.clone(), obs.content.clone()))
                     .collect();
                 if check_loop_guard_outcomes(
                     guard,
