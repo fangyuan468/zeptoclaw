@@ -62,6 +62,104 @@ pub fn classify_final_content(content: &str) -> TurnOutcome {
     TurnOutcome::FinalAnswer(content.to_string())
 }
 
+/// Streaming-mode guard that prevents provider tool markup from "appearing
+/// on screen" before the terminating `Done` event has been classified.
+///
+/// Motivation: the non-streaming end-of-turn classification on its own is
+/// not enough. The forwarder task in `process_message_streaming` receives a
+/// sequence of `StreamEvent::Delta` chunks followed by `StreamEvent::Done`.
+/// If we only classify the `Done` payload, any `Delta` chunks that contained
+/// e.g. `<minimax:tool_call>` have already been forwarded to the channel
+/// layer and rendered to the user.
+///
+/// The guard implements a minimal "look at the first non-whitespace
+/// character" heuristic:
+///
+/// * Before any non-whitespace character is observed, content is buffered
+///   silently.
+/// * When the first non-whitespace character arrives, the guard decides
+///   between two modes:
+///   - `<`: switch to **buffering** mode. Subsequent deltas accumulate in
+///     `buffer` and are not forwarded. The caller drains the buffer with
+///     [`Self::take_buffered`] only after `Done` has been classified as a
+///     legitimate `FinalAnswer`, so suspicious-looking markup is held back
+///     until the terminating classification verdict says it is safe.
+///   - anything else: switch to **streaming** mode. The accumulated leading
+///     whitespace plus this chunk is returned for immediate forwarding, and
+///     all subsequent deltas pass through verbatim.
+///
+/// This intentionally errs on the side of caution: any answer starting with
+/// `<` (extremely rare in practice for natural-language final answers) loses
+/// streaming responsiveness but is forwarded as a single Delta on success.
+/// Provider markup never reaches the user.
+#[derive(Debug, Default)]
+pub struct StreamingMarkupGuard {
+    decided: bool,
+    is_buffering: bool,
+    buffer: String,
+}
+
+impl StreamingMarkupGuard {
+    /// Create a fresh guard in the "not yet decided" state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one `StreamEvent::Delta` text chunk to the guard.
+    ///
+    /// Returns `Some(text_to_forward)` if the chunk (or a previously
+    /// withheld prefix combined with it) should be forwarded downstream
+    /// immediately, or `None` if it should be withheld pending later
+    /// disposition by [`Self::take_buffered`].
+    pub fn on_delta(&mut self, text: &str) -> Option<String> {
+        if self.decided {
+            if self.is_buffering {
+                self.buffer.push_str(text);
+                return None;
+            }
+            return Some(text.to_string());
+        }
+
+        self.buffer.push_str(text);
+        let trimmed = self.buffer.trim_start();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        self.decided = true;
+        if trimmed.starts_with('<') {
+            self.is_buffering = true;
+            None
+        } else {
+            self.is_buffering = false;
+            Some(std::mem::take(&mut self.buffer))
+        }
+    }
+
+    /// Drain any buffered text accumulated during buffering mode.
+    ///
+    /// The caller should invoke this **only after** the corresponding
+    /// `StreamEvent::Done` payload has been classified as
+    /// [`TurnOutcome::FinalAnswer`]. The buffered text is then forwarded as
+    /// a single Delta so the channel layer can render the final answer
+    /// while remaining consistent with `Done.content`.
+    ///
+    /// Returns `None` in streaming mode (the buffer is always empty there)
+    /// or when the guard is in buffering mode but has accumulated nothing.
+    pub fn take_buffered(&mut self) -> Option<String> {
+        if !self.is_buffering || self.buffer.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.buffer))
+    }
+
+    /// Whether the guard is currently withholding content (buffering mode
+    /// after seeing a `<`-prefixed first non-whitespace character).
+    pub fn is_buffering(&self) -> bool {
+        self.is_buffering
+    }
+}
+
 /// Heuristic check: does `text` look like provider-private tool-call markup
 /// leaked into the assistant content (e.g. MiniMax `<minimax:tool_call>`)?
 ///
@@ -261,5 +359,84 @@ mod tests {
         assert!(looks_like_provider_tool_markup(
             "  \n<minimax:tool_call>{}</minimax:tool_call>\n"
         ));
+    }
+
+    // ----- StreamingMarkupGuard -----
+
+    #[test]
+    fn guard_forwards_normal_text_immediately() {
+        let mut g = StreamingMarkupGuard::new();
+        assert_eq!(g.on_delta("Hello"), Some("Hello".to_string()));
+        assert_eq!(g.on_delta(", world").as_deref(), Some(", world"));
+        assert!(!g.is_buffering());
+        assert!(g.take_buffered().is_none());
+    }
+
+    #[test]
+    fn guard_holds_leading_whitespace_until_first_visible_char() {
+        let mut g = StreamingMarkupGuard::new();
+        // Pure whitespace deltas are buffered until decision time.
+        assert!(g.on_delta("   ").is_none());
+        assert!(g.on_delta("\n").is_none());
+        // First visible char `H` triggers streaming mode; the accumulated
+        // leading whitespace is flushed together with this chunk.
+        let flushed = g.on_delta("Hello").expect("should flush on decision");
+        assert_eq!(flushed, "   \nHello");
+        // Subsequent chunks pass through verbatim.
+        assert_eq!(g.on_delta(" world"), Some(" world".to_string()));
+        assert!(!g.is_buffering());
+    }
+
+    #[test]
+    fn guard_buffers_when_first_visible_char_is_angle_bracket() {
+        let mut g = StreamingMarkupGuard::new();
+        // First Delta starts with `<` — guard enters buffering mode.
+        assert!(g.on_delta("<minimax").is_none());
+        assert!(g.is_buffering());
+        // Subsequent chunks continue to accumulate, nothing is forwarded.
+        assert!(g.on_delta(":tool_call>").is_none());
+        assert!(g.on_delta("{\"q\":\"x\"}").is_none());
+        assert!(g.on_delta("</minimax:tool_call>").is_none());
+        let drained = g.take_buffered().expect("buffer should contain markup");
+        assert_eq!(
+            drained,
+            "<minimax:tool_call>{\"q\":\"x\"}</minimax:tool_call>"
+        );
+        // Calling take_buffered a second time yields nothing.
+        assert!(g.take_buffered().is_none());
+    }
+
+    #[test]
+    fn guard_buffers_when_chunked_markup_spans_first_delta_with_whitespace() {
+        let mut g = StreamingMarkupGuard::new();
+        // Leading whitespace alone is held.
+        assert!(g.on_delta("\n  ").is_none());
+        // First visible char `<` => buffering mode; the whitespace stays in
+        // the buffer rather than leaking out.
+        assert!(g.on_delta("<tool_call>").is_none());
+        assert!(g.is_buffering());
+        let drained = g.take_buffered().unwrap();
+        assert_eq!(drained, "\n  <tool_call>");
+    }
+
+    #[test]
+    fn guard_streaming_mode_returns_none_for_take_buffered() {
+        let mut g = StreamingMarkupGuard::new();
+        let _ = g.on_delta("Plain answer");
+        assert!(!g.is_buffering());
+        // Streaming mode never withholds content, so nothing to drain.
+        assert!(g.take_buffered().is_none());
+    }
+
+    #[test]
+    fn guard_take_buffered_does_not_flush_when_only_whitespace_accumulated() {
+        let mut g = StreamingMarkupGuard::new();
+        // Stream is exclusively whitespace deltas; no decision is ever made.
+        assert!(g.on_delta("   \n").is_none());
+        assert!(g.on_delta("\t").is_none());
+        // Caller may invoke take_buffered after Done; buffer is non-empty
+        // but the guard is not in buffering mode, so nothing is flushed.
+        assert!(!g.is_buffering());
+        assert!(g.take_buffered().is_none());
     }
 }
