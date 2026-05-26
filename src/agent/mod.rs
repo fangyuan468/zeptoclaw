@@ -65,6 +65,7 @@ pub mod loop_guard;
 pub mod middleware;
 pub mod pipeline;
 pub mod scratchpad;
+pub mod synthesis;
 pub mod tool_call_limit;
 pub mod turn;
 

@@ -160,6 +160,37 @@ impl StreamingMarkupGuard {
     }
 }
 
+/// Phase 2 helper: decide whether `run_final_synthesis` should run based
+/// on the loop's current state and the two relevant config flags.
+///
+/// Returns `Some(trigger_label)` (a stable string used as a log/metric
+/// dimension) if synthesis should run, or `None` otherwise. `tool_limit`
+/// takes precedence over `empty_or_markup` so that a max-iteration cutoff
+/// that *also* produced empty content is attributed to the underlying
+/// cause rather than the symptom.
+///
+/// `max_iter_with_tools` should be `true` only when the tool loop was cut
+/// off at `max_tool_iterations` while the model still wanted more tool
+/// calls; otherwise pass `false`.
+pub fn classify_synthesis_trigger(
+    outcome: &TurnOutcome,
+    max_iter_with_tools: bool,
+    allow_on_empty: bool,
+    allow_on_tool_limit: bool,
+) -> Option<&'static str> {
+    if max_iter_with_tools && allow_on_tool_limit {
+        return Some("tool_limit");
+    }
+    let needs_recovery = matches!(
+        outcome,
+        TurnOutcome::EmptyAnswer | TurnOutcome::ProviderMarkupOnly
+    );
+    if needs_recovery && allow_on_empty {
+        return Some("empty_or_markup");
+    }
+    None
+}
+
 /// Heuristic check: does `text` look like provider-private tool-call markup
 /// leaked into the assistant content (e.g. MiniMax `<minimax:tool_call>`)?
 ///
@@ -438,5 +469,92 @@ mod tests {
         // but the guard is not in buffering mode, so nothing is flushed.
         assert!(!g.is_buffering());
         assert!(g.take_buffered().is_none());
+    }
+
+    // ----- classify_synthesis_trigger -----
+
+    #[test]
+    fn synthesis_trigger_returns_none_for_final_answer() {
+        let outcome = TurnOutcome::FinalAnswer("ok".to_string());
+        assert!(classify_synthesis_trigger(&outcome, false, true, true).is_none());
+    }
+
+    #[test]
+    fn synthesis_trigger_empty_or_markup_triggers_when_allowed() {
+        assert_eq!(
+            classify_synthesis_trigger(&TurnOutcome::EmptyAnswer, false, true, true),
+            Some("empty_or_markup")
+        );
+        assert_eq!(
+            classify_synthesis_trigger(
+                &TurnOutcome::ProviderMarkupOnly,
+                false,
+                true,
+                true
+            ),
+            Some("empty_or_markup")
+        );
+    }
+
+    #[test]
+    fn synthesis_trigger_respects_empty_disabled() {
+        assert!(classify_synthesis_trigger(
+            &TurnOutcome::EmptyAnswer,
+            false,
+            false,
+            true
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn synthesis_trigger_tool_limit_when_allowed() {
+        // Even FinalAnswer can be overridden when max_iter cutoff hit, so
+        // that downstream metrics attribute the tool_limit cause correctly.
+        assert_eq!(
+            classify_synthesis_trigger(
+                &TurnOutcome::FinalAnswer("partial".to_string()),
+                true,
+                true,
+                true
+            ),
+            Some("tool_limit")
+        );
+    }
+
+    #[test]
+    fn synthesis_trigger_tool_limit_takes_precedence_over_empty() {
+        // When both signals are present, tool_limit wins so logs/metrics
+        // surface the underlying cause rather than the symptom.
+        assert_eq!(
+            classify_synthesis_trigger(&TurnOutcome::EmptyAnswer, true, true, true),
+            Some("tool_limit")
+        );
+    }
+
+    #[test]
+    fn synthesis_trigger_respects_tool_limit_disabled() {
+        assert!(classify_synthesis_trigger(
+            &TurnOutcome::FinalAnswer("partial".to_string()),
+            true,
+            true,
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn synthesis_trigger_falls_through_to_empty_when_only_empty_allowed() {
+        // tool_limit hit but disabled, while EmptyAnswer is allowed: fall
+        // through to the empty-or-markup trigger.
+        assert_eq!(
+            classify_synthesis_trigger(
+                &TurnOutcome::EmptyAnswer,
+                true,
+                true,
+                false
+            ),
+            Some("empty_or_markup")
+        );
     }
 }
