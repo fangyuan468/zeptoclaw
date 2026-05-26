@@ -66,6 +66,7 @@ pub mod middleware;
 pub mod pipeline;
 pub mod scratchpad;
 pub mod tool_call_limit;
+pub mod turn;
 
 pub use budget::TokenBudget;
 pub use context::{format_message_envelope, ContextBuilder, RuntimeContext};

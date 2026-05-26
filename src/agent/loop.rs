@@ -37,6 +37,7 @@ use crate::utils::metrics::MetricsCollector;
 use super::budget::TokenBudget;
 use super::context::{ContextBuilder, PromptCapabilities};
 use super::tool_call_limit::ToolCallLimitTracker;
+use super::turn::{classify_final_content, StreamingMarkupGuard, TurnOutcome};
 
 /// System prompt sent during the memory flush turn, instructing the LLM to
 /// persist important facts and deduplicate existing long-term memory entries.
@@ -2968,11 +2969,43 @@ impl AgentLoop {
             });
         }
 
-        // Add final assistant response
-        session.add_message(Message::assistant(&response.content));
-        self.session_manager.save(&session).await?;
-
-        Ok(response.content)
+        // Phase 1 state-machine refactor: classify final content explicitly
+        // instead of treating `!response.has_tool_calls()` as a synonym for
+        // "successful answer". Even when max_iterations was reached with
+        // tool calls still pending, the user-visible outcome is determined
+        // solely by `response.content` (no more tools will run this turn).
+        // Empty or provider-markup-only content returns an explicit error;
+        // retry / synthesis behaviour is deferred to phase 2.
+        match classify_final_content(&response.content) {
+            TurnOutcome::FinalAnswer(text) => {
+                session.add_message(Message::assistant(&text));
+                self.session_manager.save(&session).await?;
+                Ok(text)
+            }
+            TurnOutcome::EmptyAnswer => {
+                warn!(
+                    iterations = iteration,
+                    tool_call_count = response.tool_calls.len(),
+                    "agent_turn: empty final answer (phase 1: returning explicit error)"
+                );
+                Err(ZeptoError::Provider(
+                    "模型返回了空白最终答案。请重试或缩小任务范围。".to_string(),
+                ))
+            }
+            TurnOutcome::ProviderMarkupOnly => {
+                warn!(
+                    iterations = iteration,
+                    "agent_turn: provider tool markup leaked into final content (phase 1: returning explicit error)"
+                );
+                Err(ZeptoError::Provider(
+                    "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。"
+                        .to_string(),
+                ))
+            }
+            TurnOutcome::ToolCalls(_) => unreachable!(
+                "classify_final_content cannot return ToolCalls; only classify_turn_outcome can"
+            ),
+        }
     }
 
     /// Process a message with streaming output for the final LLM response.
@@ -3940,38 +3973,116 @@ impl AgentLoop {
             tokio::spawn(async move {
                 let mut session = session_clone;
                 let mut stream_rx = stream_rx;
+                // Phase 1 state-machine refactor (streaming guard): hold
+                // back content that *starts* with `<` until Done has been
+                // classified, so provider tool markup (e.g.
+                // `<minimax:tool_call>`) cannot be rendered to the user
+                // before the final classification verdict says it is safe.
+                let mut markup_guard = StreamingMarkupGuard::new();
 
                 while let Some(event) = stream_rx.recv().await {
-                    match &event {
+                    match event {
                         StreamEvent::Done { content, usage } => {
-                            if let Some(usage) = usage.as_ref() {
+                            if let Some(usage_ref) = usage.as_ref() {
                                 if let Some(metrics) = usage_metrics.as_ref() {
                                     metrics.record_tokens_with_cache(
-                                        usage.prompt_tokens as u64,
-                                        usage.completion_tokens as u64,
-                                        usage.cached_tokens as u64,
-                                        usage.cache_creation_tokens as u64,
+                                        usage_ref.prompt_tokens as u64,
+                                        usage_ref.completion_tokens as u64,
+                                        usage_ref.cached_tokens as u64,
+                                        usage_ref.cache_creation_tokens as u64,
                                     );
                                 }
                                 metrics_collector.record_tokens_with_cache(
-                                    usage.prompt_tokens as u64,
-                                    usage.completion_tokens as u64,
-                                    usage.cached_tokens as u64,
-                                    usage.cache_creation_tokens as u64,
+                                    usage_ref.prompt_tokens as u64,
+                                    usage_ref.completion_tokens as u64,
+                                    usage_ref.cached_tokens as u64,
+                                    usage_ref.cache_creation_tokens as u64,
                                 );
                             }
-                            session.add_message(Message::assistant(content));
-                            let _ = session_manager.save(&session).await;
-                            let _ = out_tx.send(event).await;
+                            // Classify the streamed final content. Only
+                            // FinalAnswer is persisted to the session and
+                            // forwarded as Done. Empty / provider-markup-only
+                            // payloads are surfaced as StreamEvent::Error
+                            // so the channel layer can show a meaningful
+                            // message instead of an empty assistant turn.
+                            let content_len = content.len();
+                            match classify_final_content(&content) {
+                                TurnOutcome::FinalAnswer(_) => {
+                                    // Flush any content the guard withheld
+                                    // because it started with `<`. The
+                                    // classification verdict confirmed it is
+                                    // a legitimate answer (not markup), so
+                                    // forward it now as a single Delta
+                                    // before the terminating Done.
+                                    if let Some(buffered) = markup_guard.take_buffered() {
+                                        let _ = out_tx
+                                            .send(StreamEvent::Delta(buffered))
+                                            .await;
+                                    }
+                                    session.add_message(Message::assistant(&content));
+                                    let _ = session_manager.save(&session).await;
+                                    let _ = out_tx
+                                        .send(StreamEvent::Done { content, usage })
+                                        .await;
+                                }
+                                TurnOutcome::EmptyAnswer => {
+                                    tracing::warn!(
+                                        content_len,
+                                        "agent_turn(streaming): empty final answer (phase 1: returning explicit error)"
+                                    );
+                                    let _ = out_tx
+                                        .send(StreamEvent::Error(ZeptoError::Provider(
+                                            "模型返回了空白最终答案。请重试或缩小任务范围。"
+                                                .to_string(),
+                                        )))
+                                        .await;
+                                }
+                                TurnOutcome::ProviderMarkupOnly => {
+                                    tracing::warn!(
+                                        content_len,
+                                        buffered = markup_guard.is_buffering(),
+                                        "agent_turn(streaming): provider tool markup leaked into final content (phase 1: returning explicit error)"
+                                    );
+                                    // Buffered markup is deliberately
+                                    // dropped on the floor: this is exactly
+                                    // the case the guard exists to suppress.
+                                    let _ = out_tx
+                                        .send(StreamEvent::Error(ZeptoError::Provider(
+                                            "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。"
+                                                .to_string(),
+                                        )))
+                                        .await;
+                                }
+                                TurnOutcome::ToolCalls(_) => unreachable!(
+                                    "classify_final_content cannot return ToolCalls"
+                                ),
+                            }
                             return;
                         }
-                        StreamEvent::ToolCalls(_) => {
+                        StreamEvent::ToolCalls(tool_calls) => {
                             // Unexpected tool calls during streaming — emit and let caller handle
-                            let _ = out_tx.send(event).await;
+                            let _ =
+                                out_tx.send(StreamEvent::ToolCalls(tool_calls)).await;
                             return;
                         }
-                        _ => {
-                            if out_tx.send(event).await.is_err() {
+                        StreamEvent::Delta(text) => {
+                            // Route through the markup guard. Returns
+                            // Some(chunk) when the guard is satisfied the
+                            // chunk is safe to forward (streaming mode,
+                            // or the initial leading-whitespace flush), or
+                            // None while it is still withholding content.
+                            if let Some(forward) = markup_guard.on_delta(&text) {
+                                if out_tx
+                                    .send(StreamEvent::Delta(forward))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        other @ StreamEvent::Error(_) => {
+                            if out_tx.send(other).await.is_err() {
                                 return;
                             }
                         }
@@ -3981,17 +4092,49 @@ impl AgentLoop {
 
             Ok(out_rx)
         } else {
-            // Still has tool calls after max iterations — return non-streaming result
-            session.add_message(Message::assistant(&response.content));
-            self.session_manager.save(&session).await?;
-
+            // Still has tool calls after max iterations — return non-streaming result.
+            //
+            // Phase 1 state-machine refactor: classify response.content so
+            // empty / provider-markup-only payloads surface as
+            // StreamEvent::Error instead of an empty Done event.
             let (tx, rx) = tokio::sync::mpsc::channel(1);
-            let _ = tx
-                .send(StreamEvent::Done {
-                    content: response.content,
-                    usage: response.usage,
-                })
-                .await;
+            match classify_final_content(&response.content) {
+                TurnOutcome::FinalAnswer(text) => {
+                    session.add_message(Message::assistant(&text));
+                    self.session_manager.save(&session).await?;
+                    let _ = tx
+                        .send(StreamEvent::Done {
+                            content: text,
+                            usage: response.usage,
+                        })
+                        .await;
+                }
+                TurnOutcome::EmptyAnswer => {
+                    warn!(
+                        tool_call_count = response.tool_calls.len(),
+                        "agent_turn(streaming): empty final answer at max iterations (phase 1: returning explicit error)"
+                    );
+                    let _ = tx
+                        .send(StreamEvent::Error(ZeptoError::Provider(
+                            "模型返回了空白最终答案。请重试或缩小任务范围。".to_string(),
+                        )))
+                        .await;
+                }
+                TurnOutcome::ProviderMarkupOnly => {
+                    warn!(
+                        "agent_turn(streaming): provider tool markup leaked at max iterations (phase 1: returning explicit error)"
+                    );
+                    let _ = tx
+                        .send(StreamEvent::Error(ZeptoError::Provider(
+                            "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。"
+                                .to_string(),
+                        )))
+                        .await;
+                }
+                TurnOutcome::ToolCalls(_) => unreachable!(
+                    "classify_final_content cannot return ToolCalls"
+                ),
+            }
             Ok(rx)
         }
     }
