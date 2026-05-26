@@ -54,20 +54,28 @@
 //! }
 //! ```
 
+mod a2ui;
 pub mod agui_events;
 pub mod budget;
 pub mod compaction;
 mod context;
+mod inbound;
 pub mod context_monitor;
 pub mod facade;
+mod file_artifact;
+mod format;
 mod r#loop;
+mod loop_events;
 pub mod loop_guard;
+mod mermaid;
 pub mod middleware;
 pub mod pipeline;
 pub mod observations;
 pub mod scratchpad;
 pub mod synthesis;
 pub mod tool_call_limit;
+pub mod tool_feedback;
+mod tool_helpers;
 pub mod turn;
 
 pub use budget::TokenBudget;
@@ -75,6 +83,6 @@ pub use context::{format_message_envelope, ContextBuilder, RuntimeContext};
 pub use context_monitor::{CompactionStrategy, ContextMonitor, PreflightAction};
 pub use facade::{ZeptoAgent, ZeptoAgentBuilder};
 pub use r#loop::AgentLoop;
-pub use r#loop::{ToolFeedback, ToolFeedbackPhase};
+pub use tool_feedback::{ToolFeedback, ToolFeedbackPhase};
 pub use scratchpad::SwarmScratchpad;
 pub use tool_call_limit::ToolCallLimitTracker;
