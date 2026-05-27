@@ -64,6 +64,7 @@ pub mod context_monitor;
 pub mod facade;
 mod file_artifact;
 mod format;
+mod harness;
 mod r#loop;
 mod loop_events;
 pub mod loop_guard;
