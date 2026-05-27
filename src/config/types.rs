@@ -458,6 +458,36 @@ pub struct CompactionConfig {
     /// Maximum overflow retries before giving up. Default: 3.
     #[serde(default = "default_overflow_retries")]
     pub overflow_retries: u32,
+    /// Anchored rolling summary configuration (token-cost-optimization §P5).
+    ///
+    /// P5.1 lands the configuration surface and the underlying capability
+    /// (`compaction::try_anchored_summary` + `ContextBuilder::with_anchored_summary`)
+    /// but does not yet invoke them — `enabled = false` by default and no
+    /// caller in the agent loop reads `anchor_step` / `target_tokens` /
+    /// `summary_model` yet. P5.2 will wire these into the Harness state and
+    /// the prompt build path.
+    #[serde(default)]
+    pub anchored_summary: AnchoredSummaryConfig,
+}
+
+/// Anchored rolling summary configuration.
+///
+/// Disabled by default. P5.1 only adds the schema and the underlying
+/// capability; P5.2 wires it into the Harness turn loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnchoredSummaryConfig {
+    /// Whether anchored rolling summary is enabled. Default: false.
+    pub enabled: bool,
+    /// Number of turns between summary refreshes (reserved for P5.2 —
+    /// not consulted by anything in P5.1). Default: 8.
+    pub anchor_step: usize,
+    /// Soft target token count for the produced summary (reserved for
+    /// P5.2 — not consulted by anything in P5.1). Default: 1024.
+    pub target_tokens: usize,
+    /// Optional cheaper model identifier used solely for summary
+    /// generation. `None` falls back to the turn's main model.
+    pub summary_model: Option<String>,
 }
 
 fn default_input_headroom_ratio() -> f64 {
@@ -485,6 +515,18 @@ impl Default for CompactionConfig {
             single_tool_result_share: default_single_tool_result_share(),
             safety_margin: default_safety_margin(),
             overflow_retries: default_overflow_retries(),
+            anchored_summary: AnchoredSummaryConfig::default(),
+        }
+    }
+}
+
+impl Default for AnchoredSummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            anchor_step: 8,
+            target_tokens: 1024,
+            summary_model: None,
         }
     }
 }

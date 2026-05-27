@@ -11,7 +11,10 @@
 //! is responsible for obtaining any LLM-generated summaries before
 //! calling `summarize_messages`.
 
+use std::sync::Arc;
+
 use super::context_monitor::CompactionUrgency;
+use crate::providers::{ChatOptions, LLMProvider};
 use crate::session::{ContentPart, Message, Role};
 
 /// Truncate messages to keep only the N most recent.
@@ -446,6 +449,65 @@ pub fn build_summary_prompt(messages: &[Message]) -> String {
     )
 }
 
+/// Generate an anchored rolling summary string from a message slice.
+///
+/// **Fail-soft** by design (token-cost-optimization §P5): summary is a
+/// caching optimization, never a hard dependency. Any provider failure
+/// — error, timeout, empty content — collapses to `Ok(None)` so the
+/// caller can skip the summary slot and continue the turn normally.
+/// The `Result` envelope is preserved for future evolution boundaries
+/// (e.g. validation that callers might want to surface), but no current
+/// branch returns `Err`.
+///
+/// # Arguments
+/// * `provider` - LLM provider to call (typically the turn's provider).
+/// * `model` - Default model to use when `summary_model` is `None`.
+/// * `messages` - Conversation slice to summarize. An empty slice
+///   collapses to `Ok(None)` without calling the provider.
+/// * `summary_model` - Optional cheaper model identifier just for
+///   summary generation. `None` falls back to `model`.
+///
+/// # Returns
+/// `Ok(Some(summary_text))` on success, `Ok(None)` on any failure or
+/// empty input. The `Result` is reserved for future hard-error
+/// extension; today the function never returns `Err`.
+///
+/// # Behavior
+/// In P5.1 nothing in the agent loop calls this function — it ships
+/// dormant alongside `ContextBuilder::with_anchored_summary` and the
+/// `compaction.anchored_summary` config block. P5.2 wires it into the
+/// Harness state and the prompt build path.
+pub async fn try_anchored_summary(
+    provider: &Arc<dyn LLMProvider>,
+    model: &str,
+    messages: &[Message],
+    summary_model: Option<&str>,
+) -> crate::error::Result<Option<String>> {
+    if messages.is_empty() {
+        return Ok(None);
+    }
+
+    let prompt = build_summary_prompt(messages);
+    let request = vec![Message::user(&prompt)];
+    let effective_model = summary_model.unwrap_or(model);
+
+    let response = provider
+        .chat(request, Vec::new(), Some(effective_model), ChatOptions::new())
+        .await;
+
+    let content = match response {
+        Ok(resp) => resp.content,
+        Err(_) => return Ok(None),
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
 /// Strip image content parts from a slice of messages, keeping only text parts.
 ///
 /// Used during compaction to remove image data from older messages that have
@@ -463,7 +525,161 @@ pub fn strip_images_from_messages(messages: &mut [Message]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ZeptoError;
+    use crate::providers::{LLMResponse, ToolDefinition};
     use crate::session::{ContentPart, ImageSource};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ── try_anchored_summary ──────────────────────────────────────────
+
+    /// Provider that returns a fixed `content` string. Records the model
+    /// it was last called with so tests can assert `summary_model`
+    /// override semantics.
+    struct FixedProvider {
+        content: String,
+        last_model: Arc<std::sync::Mutex<Option<String>>>,
+        call_count: AtomicUsize,
+    }
+
+    impl FixedProvider {
+        fn new(content: &str) -> Self {
+            Self {
+                content: content.to_string(),
+                last_model: Arc::new(std::sync::Mutex::new(None)),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for FixedProvider {
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            model: Option<&str>,
+            _options: ChatOptions,
+        ) -> crate::error::Result<LLMResponse> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_model.lock().unwrap() = model.map(|s| s.to_string());
+            Ok(LLMResponse::text(&self.content))
+        }
+        fn default_model(&self) -> &str {
+            "fake-default"
+        }
+        fn name(&self) -> &str {
+            "fixed"
+        }
+    }
+
+    /// Provider that always returns a provider error.
+    struct ErrorProvider {
+        call_count: AtomicUsize,
+    }
+
+    impl ErrorProvider {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ErrorProvider {
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _model: Option<&str>,
+            _options: ChatOptions,
+        ) -> crate::error::Result<LLMResponse> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Err(ZeptoError::Provider("boom".into()))
+        }
+        fn default_model(&self) -> &str {
+            "err-default"
+        }
+        fn name(&self) -> &str {
+            "error"
+        }
+    }
+
+    #[tokio::test]
+    async fn try_anchored_summary_empty_messages_returns_none_without_call() {
+        let provider = Arc::new(FixedProvider::new("should not be called"));
+        let dyn_provider: Arc<dyn LLMProvider> = provider.clone();
+
+        let out = try_anchored_summary(&dyn_provider, "gpt-mini", &[], None)
+            .await
+            .expect("never returns Err in P5.1");
+
+        assert!(out.is_none());
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn try_anchored_summary_success_returns_trimmed_content() {
+        let provider = Arc::new(FixedProvider::new("  hello summary  \n"));
+        let dyn_provider: Arc<dyn LLMProvider> = provider.clone();
+        let msgs = vec![Message::user("question?"), Message::assistant("answer.")];
+
+        let out = try_anchored_summary(&dyn_provider, "gpt-mini", &msgs, None)
+            .await
+            .unwrap();
+
+        assert_eq!(out.as_deref(), Some("hello summary"));
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.last_model.lock().unwrap().as_deref(),
+            Some("gpt-mini"),
+            "falls back to `model` when summary_model is None",
+        );
+    }
+
+    #[tokio::test]
+    async fn try_anchored_summary_uses_summary_model_when_present() {
+        let provider = Arc::new(FixedProvider::new("sum"));
+        let dyn_provider: Arc<dyn LLMProvider> = provider.clone();
+        let msgs = vec![Message::user("hi")];
+
+        let _ = try_anchored_summary(&dyn_provider, "gpt-main", &msgs, Some("gpt-cheap"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provider.last_model.lock().unwrap().as_deref(),
+            Some("gpt-cheap"),
+        );
+    }
+
+    #[tokio::test]
+    async fn try_anchored_summary_provider_error_collapses_to_none() {
+        let provider = Arc::new(ErrorProvider::new());
+        let dyn_provider: Arc<dyn LLMProvider> = provider.clone();
+        let msgs = vec![Message::user("hi")];
+
+        let out = try_anchored_summary(&dyn_provider, "gpt-mini", &msgs, None)
+            .await
+            .expect("provider errors must collapse to Ok(None), never Err");
+
+        assert!(out.is_none());
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn try_anchored_summary_blank_response_returns_none() {
+        let provider = Arc::new(FixedProvider::new("   \n  \t"));
+        let dyn_provider: Arc<dyn LLMProvider> = provider.clone();
+        let msgs = vec![Message::user("hi")];
+
+        let out = try_anchored_summary(&dyn_provider, "gpt-mini", &msgs, None)
+            .await
+            .unwrap();
+
+        assert!(out.is_none());
+    }
 
     // ── strip_images_from_messages ────────────────────────────────────
 

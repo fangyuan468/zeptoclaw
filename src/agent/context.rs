@@ -425,6 +425,14 @@ pub struct ContextBuilder {
     runtime_context: Option<RuntimeContext>,
     /// Optional memory context to append to system prompt
     memory_context: Option<String>,
+    /// Optional anchored rolling summary (token-cost-optimization §P5).
+    ///
+    /// When set, `build_messages_with_overrides` inserts a single
+    /// `system` message containing the summary right after the main
+    /// system message and before conversation history. `None` (default)
+    /// is byte-for-byte equivalent to the pre-P5.1 prompt. P5.1 ships
+    /// dormant — no caller writes this slot yet.
+    anchored_summary: Option<String>,
 }
 
 impl ContextBuilder {
@@ -445,6 +453,7 @@ impl ContextBuilder {
             skills_prompt: None,
             runtime_context: None,
             memory_context: None,
+            anchored_summary: None,
         }
     }
 
@@ -756,6 +765,14 @@ impl ContextBuilder {
         caps: PromptCapabilities,
     ) -> Vec<Message> {
         let mut messages = vec![self.build_system_message_with_overrides(memory_override, caps)];
+        // Anchored rolling summary slot (token-cost-optimization §P5).
+        // Inserted between the main system message and history so the
+        // LLM treats it as authoritative compressed context. P5.1 keeps
+        // this dormant (`anchored_summary` is always `None` in current
+        // callers); P5.2 wires the Harness to populate it.
+        if let Some(summary) = &self.anchored_summary {
+            messages.push(Message::system(summary));
+        }
         messages.extend(history.iter().cloned());
         if !user_input.is_empty() {
             let content = if let Some(ref ctx) = self.runtime_context {
@@ -773,6 +790,30 @@ impl ContextBuilder {
         messages
     }
 
+    /// Set or clear the anchored rolling summary slot
+    /// (token-cost-optimization §P5).
+    ///
+    /// When `Some(text)`, `build_messages_with_overrides` inserts one
+    /// extra `Message::system(text)` right after the main system
+    /// message and before history. `None` (default) keeps the prompt
+    /// byte-for-byte identical to pre-P5.1.
+    ///
+    /// P5.1 ships this method dormant — no caller in `agent::loop` or
+    /// `agent::harness` sets it yet. P5.2 wires it up.
+    ///
+    /// # Example
+    /// ```rust
+    /// use zeptoclaw::agent::ContextBuilder;
+    ///
+    /// let builder = ContextBuilder::new()
+    ///     .with_anchored_summary(Some("Previous discussion: ...".into()));
+    /// assert!(builder.anchored_summary().is_some());
+    /// ```
+    pub fn with_anchored_summary(mut self, summary: Option<String>) -> Self {
+        self.anchored_summary = summary;
+        self
+    }
+
     /// Get the current system prompt.
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
@@ -786,6 +827,11 @@ impl ContextBuilder {
     /// Check if skills are configured.
     pub fn has_skills(&self) -> bool {
         self.skills_prompt.is_some()
+    }
+
+    /// Get the configured anchored rolling summary, if any.
+    pub fn anchored_summary(&self) -> Option<&str> {
+        self.anchored_summary.as_deref()
     }
 }
 
@@ -1723,5 +1769,100 @@ mod tests {
         assert!(FIRST_RUN_PERSONA_PROMPT.contains("First Conversation Setup"));
         assert!(FIRST_RUN_PERSONA_PROMPT.contains("concise"));
         assert!(FIRST_RUN_PERSONA_PROMPT.contains("persona_pref"));
+    }
+
+    // ── P5.1 anchored rolling summary slot ────────────────────────────
+
+    #[test]
+    fn p5_anchored_summary_default_is_none() {
+        let builder = ContextBuilder::new();
+        assert!(builder.anchored_summary().is_none());
+    }
+
+    #[test]
+    fn p5_with_anchored_summary_sets_and_clears() {
+        let builder = ContextBuilder::new().with_anchored_summary(Some("sum-text".into()));
+        assert_eq!(builder.anchored_summary(), Some("sum-text"));
+
+        let cleared = builder.with_anchored_summary(None);
+        assert!(cleared.anchored_summary().is_none());
+    }
+
+    #[test]
+    fn p5_build_with_overrides_none_summary_matches_baseline() {
+        // Zero-behavior-change invariant: an unset anchored_summary must
+        // produce the exact same message slice as a pre-P5.1 build. The
+        // surrounding test suite is the regression net; this case just
+        // pins the byte-for-byte equivalence for callers reading the
+        // module.
+        let history = vec![Message::user("hi"), Message::assistant("hello")];
+        let baseline = ContextBuilder::new().build_messages_with_overrides(
+            &history,
+            "next",
+            None,
+            PromptCapabilities::default(),
+        );
+        let with_none = ContextBuilder::new()
+            .with_anchored_summary(None)
+            .build_messages_with_overrides(
+                &history,
+                "next",
+                None,
+                PromptCapabilities::default(),
+            );
+
+        assert_eq!(baseline.len(), with_none.len());
+        for (a, b) in baseline.iter().zip(with_none.iter()) {
+            assert_eq!(a.role, b.role);
+            assert_eq!(a.content, b.content);
+        }
+    }
+
+    #[test]
+    fn p5_build_with_overrides_inserts_summary_between_system_and_history() {
+        let history = vec![Message::user("hi"), Message::assistant("hello")];
+        let messages = ContextBuilder::new()
+            .with_anchored_summary(Some("[summary] previous turns covered X, Y, Z.".into()))
+            .build_messages_with_overrides(
+                &history,
+                "next",
+                None,
+                PromptCapabilities::default(),
+            );
+
+        // Expect: [system, summary(system), user(hi), assistant(hello), user(next)]
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].role, Role::System);
+        assert_eq!(
+            messages[1].content,
+            "[summary] previous turns covered X, Y, Z."
+        );
+        assert_eq!(messages[2].role, Role::User);
+        assert_eq!(messages[2].content, "hi");
+        assert_eq!(messages[3].role, Role::Assistant);
+        assert_eq!(messages[4].role, Role::User);
+        assert!(messages[4].content.ends_with("next"));
+    }
+
+    #[test]
+    fn p5_legacy_build_messages_ignores_summary() {
+        // P5.1 only wires the summary slot into `_with_overrides`. The
+        // simplified `build_messages` entry point is unused by the
+        // production path (Harness goes through `_with_overrides`) and
+        // is intentionally left alone for now. This test pins that
+        // contract so future readers don't change it accidentally.
+        let history = vec![Message::user("hi")];
+        let messages = ContextBuilder::new()
+            .with_anchored_summary(Some("ignored in legacy path".into()))
+            .build_messages(&history, "next");
+
+        // Just the system message, history, and user input — no summary.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].role, Role::User);
+        assert_eq!(messages[1].content, "hi");
+        assert_eq!(messages[2].role, Role::User);
+        assert!(messages[2].content.ends_with("next"));
     }
 }
