@@ -25,20 +25,15 @@ use crate::tools::approval::{ApprovalGate, ApprovalRequest, ApprovalResponse};
 use crate::tools::{Tool, ToolContext, ToolRegistry};
 use crate::utils::metrics::MetricsCollector;
 
+use super::a2ui::{emit_a2ui_messages, extract_a2ui_messages_from_response};
 use super::budget::TokenBudget;
 use super::context::{ContextBuilder, PromptCapabilities};
-use super::a2ui::{emit_a2ui_messages, extract_a2ui_messages_from_response};
 use super::format::resolve_streamed_response_text;
 use super::inbound::resolve_images_to_base64;
-use super::loop_events::{
-    is_streaming_capable,
-    supports_custom_ui_channel,
-};
-use super::tool_helpers::{
-    propagate_routing_metadata, ApprovalHandler,
-};
+use super::loop_events::{is_streaming_capable, supports_custom_ui_channel};
 use super::tool_call_limit::ToolCallLimitTracker;
 use super::tool_feedback::ToolFeedback;
+use super::tool_helpers::{propagate_routing_metadata, ApprovalHandler};
 
 /// System prompt sent during the memory flush turn, instructing the LLM to
 /// persist important facts and deduplicate existing long-term memory entries.
@@ -50,7 +45,6 @@ Be selective: only save what would be useful in future conversations.";
 
 /// Maximum wall-clock time (in seconds) allowed for the memory flush LLM turn.
 const MEMORY_FLUSH_TIMEOUT_SECS: u64 = 10;
-
 
 /// The main agent loop that processes messages and coordinates with LLM providers.
 ///
@@ -129,15 +123,24 @@ pub struct AgentLoop {
     /// fall back to `Unknown` (legacy `chat_id`-keyed behaviour) until
     /// then. `OnceLock` keeps the setter `&self`-only so callers don't
     /// need exclusive ownership of the `Arc<AgentLoop>`.
-    pub(super) thread_identity: std::sync::OnceLock<Arc<crate::tools::thread_identity::ThreadIdentity>>,
+    pub(super) thread_identity:
+        std::sync::OnceLock<Arc<crate::tools::thread_identity::ThreadIdentity>>,
     /// Agent mode for category-based tool enforcement.
     pub(super) agent_mode: crate::security::AgentMode,
     /// Optional safety layer for tool output sanitization.
     pub(super) safety_layer: Option<Arc<SafetyLayer>>,
     /// Optional context monitor for compaction.
     pub(super) context_monitor: Option<ContextMonitor>,
+    /// Per-session anchored summary refresh watermark.
+    ///
+    /// The summary text itself lives on `Session::summary` so it persists with
+    /// the session. This in-memory map only tracks the last message count at
+    /// which P5.2 attempted a refresh, preventing an extra summary provider
+    /// call on every turn once a session crosses `anchor_step`.
+    pub(super) anchored_summary_steps: Arc<Mutex<HashMap<String, AnchoredSummaryState>>>,
     /// Optional channel for tool execution feedback (tool name + duration).
-    pub(super) tool_feedback_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<ToolFeedback>>>>,
+    pub(super) tool_feedback_tx:
+        Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<ToolFeedback>>>>,
     /// Optional LLM response cache (SHA-256 keyed, TTL + LRU).
     pub(super) cache: Option<Arc<std::sync::Mutex<ResponseCache>>>,
     /// Optional pairing manager for device token validation.
@@ -151,7 +154,23 @@ pub struct AgentLoop {
     #[cfg(feature = "panel")]
     pub(super) event_bus: Option<crate::api::events::EventBus>,
     /// MCP clients to shut down when the agent stops (prevents zombie child processes).
-    pub(super) mcp_clients: Arc<tokio::sync::RwLock<Vec<Arc<crate::tools::mcp::client::McpClient>>>>,
+    pub(super) mcp_clients:
+        Arc<tokio::sync::RwLock<Vec<Arc<crate::tools::mcp::client::McpClient>>>>,
+}
+
+/// In-memory runtime metadata for anchored rolling summary.
+///
+/// `Session::summary` stores the durable summary text. This state tracks how
+/// much of `Session::messages` that summary covers so the prompt can safely
+/// omit only the already-summarized prefix.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct AnchoredSummaryState {
+    /// Number of leading session messages covered by `Session::summary`.
+    pub(super) anchored_message_count: usize,
+    /// Number of leading session messages included in the latest summary
+    /// attempt. This throttles fail-soft retries without pretending a failed
+    /// attempt produced a usable summary.
+    pub(super) last_attempt_message_count: usize,
 }
 
 impl AgentLoop {
@@ -247,6 +266,7 @@ impl AgentLoop {
             agent_mode,
             safety_layer,
             context_monitor,
+            anchored_summary_steps: Arc::new(Mutex::new(HashMap::new())),
             tool_feedback_tx: Arc::new(RwLock::new(None)),
             cache,
             pairing,
@@ -313,6 +333,7 @@ impl AgentLoop {
             agent_mode,
             safety_layer,
             context_monitor,
+            anchored_summary_steps: Arc::new(Mutex::new(HashMap::new())),
             tool_feedback_tx: Arc::new(RwLock::new(None)),
             cache,
             pairing,
@@ -573,7 +594,9 @@ impl AgentLoop {
     /// - The LLM call fails
     /// - Session management fails
     pub async fn process_message(&self, msg: &InboundMessage) -> Result<String> {
-        super::harness::Harness::new(self).process_message(msg).await
+        super::harness::Harness::new(self)
+            .process_message(msg)
+            .await
     }
 
     /// Process a message with streaming output for the final LLM response.
@@ -586,7 +609,9 @@ impl AgentLoop {
         &self,
         msg: &InboundMessage,
     ) -> Result<tokio::sync::mpsc::Receiver<crate::providers::StreamEvent>> {
-        super::harness::Harness::new(self).process_message_streaming(msg).await
+        super::harness::Harness::new(self)
+            .process_message_streaming(msg)
+            .await
     }
 
     /// Check if a ZeptoError is a context overflow that can be retried via compaction.
@@ -737,12 +762,29 @@ impl AgentLoop {
         } else {
             PromptCapabilities::default()
         };
-        let mut msgs = self.context_builder.build_messages_with_overrides(
-            &session.messages,
-            "",
-            memory_override,
-            caps,
-        );
+        let mut history_start = 0usize;
+        let mut anchored_summary = None;
+        if self.config.compaction.anchored_summary.enabled {
+            if let Some(summary) = session.summary.as_deref() {
+                let state = self.anchored_summary_steps.lock().await;
+                if let Some(anchor) = state.get(&session.key) {
+                    let covered = anchor.anchored_message_count.min(session.messages.len());
+                    if covered > 0 {
+                        history_start = covered;
+                        anchored_summary = Some(summary);
+                    }
+                }
+            }
+        }
+        let mut msgs = self
+            .context_builder
+            .build_messages_with_anchored_summary_override(
+                &session.messages[history_start..],
+                "",
+                memory_override,
+                caps,
+                anchored_summary,
+            );
 
         // Resolve image file paths to base64 before filtering
         if let Some(dir) = self.session_manager.sessions_dir() {
@@ -1405,7 +1447,6 @@ impl AgentLoop {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::file_artifact::{
         build_file_artifact_payload, publish_file_artifact_event, FileArtifactCandidate,
         FileArtifactOperation,
@@ -1419,6 +1460,7 @@ mod tests {
         is_trusted_local_session, needs_sequential_execution, resolve_tool_approval,
         INTERACTIVE_CLI_METADATA_KEY, TRUSTED_LOCAL_SESSION_METADATA_KEY,
     };
+    use super::*;
     use crate::agent::agui_events;
     use crate::bus::message::{
         OutboundMessageKind, OUTBOUND_CUSTOM_NAME_KEY, OUTBOUND_CUSTOM_PAYLOAD_KEY,
@@ -1440,6 +1482,32 @@ mod tests {
         calls: std::sync::Mutex<u8>,
         tool_name: &'static str,
         tool_args: &'static str,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedProviderCall {
+        is_summary: bool,
+        messages: Vec<Message>,
+        model: Option<String>,
+        max_tokens: Option<u32>,
+    }
+
+    struct AnchoredSummaryTestProvider {
+        calls: std::sync::Mutex<Vec<RecordedProviderCall>>,
+        fail_summary: bool,
+    }
+
+    impl AnchoredSummaryTestProvider {
+        fn new(fail_summary: bool) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail_summary,
+            }
+        }
+
+        fn calls(&self) -> Vec<RecordedProviderCall> {
+            self.calls.lock().expect("calls lock poisoned").clone()
+        }
     }
 
     #[async_trait]
@@ -1491,6 +1559,49 @@ mod tests {
             } else {
                 let call_num = *calls as u32;
                 Ok(LLMResponse::text("done").with_usage(Usage::new(10 + call_num, call_num)))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for AnchoredSummaryTestProvider {
+        fn name(&self) -> &str {
+            "anchored-summary-test"
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+
+        async fn chat(
+            &self,
+            messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            model: Option<&str>,
+            options: ChatOptions,
+        ) -> Result<LLMResponse> {
+            let is_summary = messages
+                .first()
+                .map(|m| m.content.contains("Summarize the following conversation"))
+                .unwrap_or(false);
+            self.calls
+                .lock()
+                .expect("calls lock poisoned")
+                .push(RecordedProviderCall {
+                    is_summary,
+                    messages,
+                    model: model.map(str::to_string),
+                    max_tokens: options.max_tokens,
+                });
+
+            if is_summary {
+                if self.fail_summary {
+                    Err(ZeptoError::Provider("summary failed".into()))
+                } else {
+                    Ok(LLMResponse::text("rolled summary"))
+                }
+            } else {
+                Ok(LLMResponse::text("ok"))
             }
         }
     }
@@ -2072,6 +2183,142 @@ tail line
         let err = result.unwrap_err();
         assert!(matches!(err, ZeptoError::Provider(_)));
         assert!(err.to_string().contains("No provider configured"));
+    }
+
+    #[tokio::test]
+    async fn test_anchored_summary_disabled_does_not_call_summary_provider() {
+        let mut config = Config::default();
+        config.compaction.anchored_summary.enabled = false;
+        config.compaction.anchored_summary.anchor_step = 2;
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let provider = Arc::new(AnchoredSummaryTestProvider::new(false));
+        agent.set_provider_arc(provider.clone()).await;
+
+        for (idx, content) in ["one", "two", "three"].into_iter().enumerate() {
+            let msg = InboundMessage::new("cli", "user", "anchored-disabled", content);
+            let result = agent.process_message(&msg).await.unwrap();
+            assert_eq!(
+                result, "ok",
+                "turn {idx} should use normal provider response"
+            );
+        }
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|call| !call.is_summary));
+        assert!(calls
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("[Conversation Summary]")));
+        let session = agent
+            .session_manager
+            .get("cli:anchored-disabled")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_anchored_summary_enabled_rolls_and_trims_prompt_prefix() {
+        let mut config = Config::default();
+        config.compaction.anchored_summary.enabled = true;
+        config.compaction.anchored_summary.anchor_step = 2;
+        config.compaction.anchored_summary.target_tokens = 77;
+        config.compaction.anchored_summary.summary_model = Some("summary-model".into());
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let provider = Arc::new(AnchoredSummaryTestProvider::new(false));
+        agent.set_provider_arc(provider.clone()).await;
+
+        for content in ["first user", "second user", "third user"] {
+            let msg = InboundMessage::new("cli", "user", "anchored-enabled", content);
+            assert_eq!(agent.process_message(&msg).await.unwrap(), "ok");
+        }
+
+        let calls = provider.calls();
+        let summary_calls: Vec<_> = calls.iter().filter(|call| call.is_summary).collect();
+        assert_eq!(summary_calls.len(), 1);
+        assert_eq!(summary_calls[0].model.as_deref(), Some("summary-model"));
+        assert_eq!(summary_calls[0].max_tokens, Some(77));
+        assert!(summary_calls[0].messages[0].content.contains("first user"));
+        assert!(!summary_calls[0].messages[0].content.contains("third user"));
+
+        let last_main = calls
+            .iter()
+            .rev()
+            .find(|call| !call.is_summary)
+            .expect("main call recorded");
+        assert!(last_main
+            .messages
+            .iter()
+            .any(|m| m.content == "[Conversation Summary]\nrolled summary"));
+        assert!(last_main
+            .messages
+            .iter()
+            .any(|m| m.content.contains("second user")));
+        assert!(last_main
+            .messages
+            .iter()
+            .any(|m| m.content.contains("third user")));
+        assert!(last_main
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("first user")));
+
+        let session = agent
+            .session_manager
+            .get("cli:anchored-enabled")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.summary.as_deref(), Some("rolled summary"));
+    }
+
+    #[tokio::test]
+    async fn test_anchored_summary_provider_failure_keeps_full_history() {
+        let mut config = Config::default();
+        config.compaction.anchored_summary.enabled = true;
+        config.compaction.anchored_summary.anchor_step = 2;
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let provider = Arc::new(AnchoredSummaryTestProvider::new(true));
+        agent.set_provider_arc(provider.clone()).await;
+
+        for content in ["first user", "second user", "third user"] {
+            let msg = InboundMessage::new("cli", "user", "anchored-failure", content);
+            assert_eq!(agent.process_message(&msg).await.unwrap(), "ok");
+        }
+
+        let calls = provider.calls();
+        assert_eq!(calls.iter().filter(|call| call.is_summary).count(), 1);
+        let last_main = calls
+            .iter()
+            .rev()
+            .find(|call| !call.is_summary)
+            .expect("main call recorded");
+        assert!(last_main
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("[Conversation Summary]")));
+        assert!(last_main
+            .messages
+            .iter()
+            .any(|m| m.content.contains("first user")));
+
+        let session = agent
+            .session_manager
+            .get("cli:anchored-failure")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.summary.is_none());
     }
 
     #[tokio::test]

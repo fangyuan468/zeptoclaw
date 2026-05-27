@@ -427,11 +427,11 @@ pub struct ContextBuilder {
     memory_context: Option<String>,
     /// Optional anchored rolling summary (token-cost-optimization §P5).
     ///
-    /// When set, `build_messages_with_overrides` inserts a single
-    /// `system` message containing the summary right after the main
-    /// system message and before conversation history. `None` (default)
-    /// is byte-for-byte equivalent to the pre-P5.1 prompt. P5.1 ships
-    /// dormant — no caller writes this slot yet.
+    /// When set directly, `build_messages_with_overrides` inserts a single
+    /// `system` summary message right after the main system message and before
+    /// conversation history. `None` (default) is byte-for-byte equivalent to
+    /// the pre-P5.1 prompt. Production P5.2 uses the explicit per-session
+    /// override method instead of mutating this shared builder field.
     anchored_summary: Option<String>,
 }
 
@@ -764,18 +764,38 @@ impl ContextBuilder {
         memory_override: Option<&str>,
         caps: PromptCapabilities,
     ) -> Vec<Message> {
+        self.build_messages_with_anchored_summary_override(
+            history,
+            user_input,
+            memory_override,
+            caps,
+            self.anchored_summary.as_deref(),
+        )
+    }
+
+    /// Build the full message list with an explicit anchored-summary override.
+    ///
+    /// This keeps the per-session rolling summary out of the shared
+    /// `ContextBuilder` instance. The agent loop passes `Session::summary`
+    /// here when `compaction.anchored_summary.enabled` is true.
+    pub(crate) fn build_messages_with_anchored_summary_override(
+        &self,
+        history: &[Message],
+        user_input: &str,
+        memory_override: Option<&str>,
+        caps: PromptCapabilities,
+        anchored_summary: Option<&str>,
+    ) -> Vec<Message> {
         let mut messages = vec![self.build_system_message_with_overrides(memory_override, caps)];
         // Anchored rolling summary slot (token-cost-optimization §P5).
         // Inserted between the main system message and history so the
-        // LLM treats it as authoritative compressed context. P5.1 keeps
-        // this dormant (`anchored_summary` is always `None` in current
-        // callers); P5.2 wires the Harness to populate it.
+        // LLM treats it as authoritative compressed context.
         //
         // The `[Conversation Summary]\n` prefix matches
         // `compaction::summarize_messages` so the two summary code paths
         // emit byte-identical envelopes and the LLM sees one stable
         // anchor header regardless of which path produced the summary.
-        if let Some(summary) = &self.anchored_summary {
+        if let Some(summary) = anchored_summary {
             messages.push(Message::system(&format!(
                 "[Conversation Summary]\n{}",
                 summary
@@ -1366,7 +1386,10 @@ mod tests {
         assert!(soul_pos < skills_pos, "SOUL before Skills");
         assert!(skills_pos < runtime_pos, "Skills before Runtime Context");
         assert!(runtime_pos < memory_pos, "Runtime Context before Memory");
-        assert!(memory_pos < today_pos, "Memory before Today is: (P3 core invariant)");
+        assert!(
+            memory_pos < today_pos,
+            "Memory before Today is: (P3 core invariant)"
+        );
     }
 
     #[test]
@@ -1437,8 +1460,8 @@ mod tests {
 
     #[test]
     fn p3_layered_memory_override_empty_suppresses_l3() {
-        let builder = ContextBuilder::new()
-            .with_memory_context("## Memory\n\n- stored".to_string());
+        let builder =
+            ContextBuilder::new().with_memory_context("## Memory\n\n- stored".to_string());
         let layered = builder.build_system_layered(PromptCapabilities::default(), Some(""));
         assert!(
             layered.l3_memory.is_none(),
@@ -1812,12 +1835,7 @@ mod tests {
         );
         let with_none = ContextBuilder::new()
             .with_anchored_summary(None)
-            .build_messages_with_overrides(
-                &history,
-                "next",
-                None,
-                PromptCapabilities::default(),
-            );
+            .build_messages_with_overrides(&history, "next", None, PromptCapabilities::default());
 
         assert_eq!(baseline.len(), with_none.len());
         for (a, b) in baseline.iter().zip(with_none.iter()) {
@@ -1831,12 +1849,7 @@ mod tests {
         let history = vec![Message::user("hi"), Message::assistant("hello")];
         let messages = ContextBuilder::new()
             .with_anchored_summary(Some("previous turns covered X, Y, Z.".into()))
-            .build_messages_with_overrides(
-                &history,
-                "next",
-                None,
-                PromptCapabilities::default(),
-            );
+            .build_messages_with_overrides(&history, "next", None, PromptCapabilities::default());
 
         // Expect: [system, summary(system), user(hi), assistant(hello), user(next)]
         assert_eq!(messages.len(), 5);

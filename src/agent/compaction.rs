@@ -473,15 +473,28 @@ pub fn build_summary_prompt(messages: &[Message]) -> String {
 /// extension; today the function never returns `Err`.
 ///
 /// # Behavior
-/// In P5.1 nothing in the agent loop calls this function — it ships
-/// dormant alongside `ContextBuilder::with_anchored_summary` and the
-/// `compaction.anchored_summary` config block. P5.2 wires it into the
-/// Harness state and the prompt build path.
+/// The agent loop uses the `_with_target` variant once
+/// `compaction.anchored_summary.enabled` is true. This wrapper preserves the
+/// P5.1 API for callers that do not need a summary-specific token cap.
 pub async fn try_anchored_summary(
     provider: &Arc<dyn LLMProvider>,
     model: &str,
     messages: &[Message],
     summary_model: Option<&str>,
+) -> crate::error::Result<Option<String>> {
+    try_anchored_summary_with_target(provider, model, messages, summary_model, None).await
+}
+
+/// Generate an anchored rolling summary with an optional output token cap.
+///
+/// P5.2 uses this variant so `compaction.anchored_summary.target_tokens`
+/// becomes active without breaking the P5.1 helper signature.
+pub async fn try_anchored_summary_with_target(
+    provider: &Arc<dyn LLMProvider>,
+    model: &str,
+    messages: &[Message],
+    summary_model: Option<&str>,
+    target_tokens: Option<usize>,
 ) -> crate::error::Result<Option<String>> {
     if messages.is_empty() {
         return Ok(None);
@@ -490,9 +503,16 @@ pub async fn try_anchored_summary(
     let prompt = build_summary_prompt(messages);
     let request = vec![Message::user(&prompt)];
     let effective_model = summary_model.unwrap_or(model);
+    let mut options = ChatOptions::new();
+    if let Some(max_tokens) = target_tokens
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+    {
+        options = options.with_max_tokens(max_tokens);
+    }
 
     let response = provider
-        .chat(request, Vec::new(), Some(effective_model), ChatOptions::new())
+        .chat(request, Vec::new(), Some(effective_model), options)
         .await;
 
     let content = match response {

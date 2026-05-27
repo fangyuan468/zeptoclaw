@@ -21,8 +21,8 @@ use crate::agent::loop_guard::LoopGuard;
 use crate::bus::InboundMessage;
 use crate::cache::ResponseCache;
 use crate::error::{Result, ZeptoError};
-use crate::providers::ChatOptions;
-use crate::session::{Message, Role};
+use crate::providers::{ChatOptions, LLMProvider};
+use crate::session::{Message, Role, Session};
 use crate::tools::ToolContext;
 
 use super::file_artifact::{
@@ -38,7 +38,7 @@ use super::loop_events::{
     ToolCallOutcome,
 };
 use super::observations::{ToolObservation, ToolObservationKind};
-use super::r#loop::AgentLoop;
+use super::r#loop::{AgentLoop, AnchoredSummaryState};
 use super::tool_feedback::{ToolFeedback, ToolFeedbackPhase};
 use super::tool_helpers::{
     check_loop_guard, check_loop_guard_outcomes, is_trusted_local_session,
@@ -60,6 +60,81 @@ pub(super) struct Harness<'a> {
 impl<'a> Harness<'a> {
     pub(super) fn new(agent: &'a AgentLoop) -> Self {
         Self { agent }
+    }
+
+    async fn refresh_anchored_summary_if_due(
+        &self,
+        session: &mut Session,
+        provider: &Arc<dyn LLMProvider>,
+        model: &str,
+    ) {
+        let cfg = &self.agent.config.compaction.anchored_summary;
+        if !cfg.enabled {
+            return;
+        }
+
+        let active_window = cfg.anchor_step.max(1);
+        let mut anchor_boundary = session.messages.len().saturating_sub(active_window);
+        while anchor_boundary > 0 && session.messages[anchor_boundary].role != Role::User {
+            anchor_boundary -= 1;
+        }
+        if anchor_boundary == 0 {
+            return;
+        }
+
+        let state = {
+            let state = self.agent.anchored_summary_steps.lock().await;
+            state.get(&session.key).copied().unwrap_or_default()
+        };
+        let due = anchor_boundary.saturating_sub(state.last_attempt_message_count)
+            >= cfg.anchor_step.max(1);
+        if !due {
+            return;
+        }
+
+        let from = state.anchored_message_count.min(anchor_boundary);
+        let mut summary_input = Vec::new();
+        if let Some(previous) = session.summary.as_deref() {
+            summary_input.push(Message::system(&format!(
+                "[Previous Conversation Summary]\n{}",
+                previous
+            )));
+        }
+        summary_input.extend(session.messages[from..anchor_boundary].iter().cloned());
+
+        let summary = crate::agent::compaction::try_anchored_summary_with_target(
+            provider,
+            model,
+            &summary_input,
+            cfg.summary_model.as_deref(),
+            Some(cfg.target_tokens),
+        )
+        .await
+        .unwrap_or(None);
+
+        let mut state_map = self.agent.anchored_summary_steps.lock().await;
+        let entry = state_map.entry(session.key.clone()).or_default();
+        entry.last_attempt_message_count = anchor_boundary;
+        if let Some(summary) = summary {
+            session.set_summary(&summary);
+            *entry = AnchoredSummaryState {
+                anchored_message_count: anchor_boundary,
+                last_attempt_message_count: anchor_boundary,
+            };
+            debug!(
+                session = %session.key,
+                anchored_messages = anchor_boundary,
+                active_window,
+                "Anchored rolling summary refreshed"
+            );
+        } else {
+            debug!(
+                session = %session.key,
+                attempted_messages = anchor_boundary,
+                active_window,
+                "Anchored rolling summary refresh skipped (no summary returned)"
+            );
+        }
     }
 
     pub(super) async fn process_message(&self, msg: &InboundMessage) -> Result<String> {
@@ -137,6 +212,8 @@ impl<'a> Harness<'a> {
             metrics.clone()
         };
         let metrics_collector = Arc::clone(&self.agent.metrics_collector);
+        let model_string = self.agent.resolve_model_for_message(msg);
+        let model = Some(model_string.as_str());
 
         // Get or create session
         let mut session = self.agent.session_manager.get_or_create(&msg.session_key).await?;
@@ -172,6 +249,9 @@ impl<'a> Harness<'a> {
                 session.messages = recovered;
             }
         }
+
+        self.refresh_anchored_summary_if_due(&mut session, &provider, &model_string)
+            .await;
 
         // Build messages with history and per-message memory override.
         // Pass an empty user_input string: the current user message is already
@@ -226,9 +306,6 @@ impl<'a> Harness<'a> {
         let options = ChatOptions::new()
             .with_max_tokens(self.agent.config.agents.defaults.max_tokens)
             .with_temperature(self.agent.config.agents.defaults.temperature);
-
-        let model_string = self.agent.resolve_model_for_message(msg);
-        let model = Some(model_string.as_str());
 
         // Check token budget before first LLM call
         if self.agent.token_budget.is_exceeded() {
@@ -1417,6 +1494,8 @@ impl<'a> Harness<'a> {
             metrics.clone()
         };
         let metrics_collector = Arc::clone(&self.agent.metrics_collector);
+        let model_string = self.agent.resolve_model_for_message(msg);
+        let model = Some(model_string.as_str());
 
         let mut session = self.agent.session_manager.get_or_create(&msg.session_key).await?;
 
@@ -1450,6 +1529,9 @@ impl<'a> Harness<'a> {
                 session.messages = recovered;
             }
         }
+
+        self.refresh_anchored_summary_if_due(&mut session, &provider, &model_string)
+            .await;
 
         // Pass an empty user_input: the current user message is already in session.
         let memory_override = self.agent.build_memory_override(&resolved_user_prompt).await;
@@ -1499,9 +1581,6 @@ impl<'a> Harness<'a> {
         let options = ChatOptions::new()
             .with_max_tokens(self.agent.config.agents.defaults.max_tokens)
             .with_temperature(self.agent.config.agents.defaults.temperature);
-        let model_string = self.agent.resolve_model_for_message(msg);
-        let model = Some(model_string.as_str());
-
         // Check token budget before first LLM call
         if self.agent.token_budget.is_exceeded() {
             return Err(ZeptoError::Provider(format!(
