@@ -45,7 +45,9 @@ use super::tool_helpers::{
     needs_sequential_execution, resolve_tool_approval, resolve_tool_call_name,
     sync_trimmed_tool_results,
 };
-use super::turn::{classify_final_content, classify_synthesis_trigger, TurnOutcome};
+use super::turn::{
+    classify_final_content, classify_synthesis_trigger, StreamingMarkupGuard, TurnOutcome,
+};
 
 /// Per-turn runner that drives the agent state machine for a single inbound
 /// message. Borrows `&AgentLoop` for the duration of one turn; does **not**
@@ -1335,6 +1337,1331 @@ impl<'a> Harness<'a> {
             TurnOutcome::ToolCalls(_) => unreachable!(
                 "classify_final_content cannot return ToolCalls; only classify_turn_outcome can"
             ),
+        }
+    }
+
+    pub(super) async fn process_message_streaming(
+        &self,
+        msg: &InboundMessage,
+    ) -> Result<tokio::sync::mpsc::Receiver<crate::providers::StreamEvent>> {
+        use crate::providers::StreamEvent;
+
+        // Acquire per-session lock
+        let session_lock = self.agent.session_lock_for(&msg.session_key).await;
+        let _session_guard = session_lock.lock().await;
+
+        // Reset per-run counters so limits apply to each process_message call
+        // independently, not across the lifetime of the AgentLoop struct.
+        self.agent.tool_call_limit.reset();
+        self.agent.token_budget.reset();
+
+        // Resolve the inbound message content first (inlines text attachments) so the
+        // injection scanner sees the fully-expanded prompt, not just msg.content.
+        let user_message = inbound_to_message(msg, None).await;
+        let resolved_user_prompt = user_message.content.clone();
+
+        // Tiered inbound injection scanning (streaming path).
+        // Runs before provider resolution so injected payloads are rejected immediately
+        // without touching the session or LLM.
+        // Scans the RESOLVED content (after text attachments are inlined) so injected
+        // payloads in attachments never reach the model.
+        if self.agent.config.safety.enabled && self.agent.config.safety.injection_check_enabled {
+            let scan = crate::safety::sanitizer::check_injection(&resolved_user_prompt);
+            if scan.was_modified {
+                let channel = msg.channel.as_str();
+                match channel {
+                    "webhook" => {
+                        warn!(
+                            channel = channel,
+                            sender = %msg.sender_id,
+                            warnings = ?scan.warnings,
+                            "Inbound injection BLOCKED from untrusted channel (streaming)"
+                        );
+                        crate::audit::log_audit_event(
+                            crate::audit::AuditCategory::InjectionAttempt,
+                            crate::audit::AuditSeverity::Critical,
+                            "inbound_injection_blocked",
+                            &format!("Channel: {}, sender: {}", channel, msg.sender_id),
+                            true,
+                        );
+                        return Err(ZeptoError::Tool(
+                            "Message rejected: potential prompt injection detected".into(),
+                        ));
+                    }
+                    _ => {
+                        warn!(
+                            channel = channel,
+                            sender = %msg.sender_id,
+                            warnings = ?scan.warnings,
+                            "Inbound injection WARNING from allowlisted channel (streaming)"
+                        );
+                        crate::audit::log_audit_event(
+                            crate::audit::AuditCategory::InjectionAttempt,
+                            crate::audit::AuditSeverity::Warning,
+                            "inbound_injection_warned",
+                            &format!("Channel: {}, sender: {}", channel, msg.sender_id),
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+
+        let provider = self
+            .agent
+            .resolve_provider_for_message(msg)
+            .await
+            .ok_or_else(|| ZeptoError::Provider("No provider configured".into()))?;
+        let usage_metrics = {
+            let metrics = self.agent.usage_metrics.read().await;
+            metrics.clone()
+        };
+        let metrics_collector = Arc::clone(&self.agent.metrics_collector);
+
+        let mut session = self.agent.session_manager.get_or_create(&msg.session_key).await?;
+
+        // Add the user message BEFORE compaction so compaction sees the full context.
+        session.add_message(user_message);
+
+        // Apply three-tier context overflow recovery if needed (streaming)
+        if let Some(ref monitor) = self.agent.context_monitor {
+            if let Some(urgency) = monitor.urgency(&session.messages) {
+                if matches!(urgency, CompactionUrgency::Normal) {
+                    self.agent.memory_flush(&session.messages).await;
+                }
+
+                let context_limit = self.agent.config.compaction.context_limit;
+                let tool_result_cap = self.agent.config.agents.defaults.max_tool_result_bytes;
+                let (recovered, tier) = crate::agent::compaction::try_recover_context_with_urgency(
+                    session.messages,
+                    context_limit,
+                    urgency,
+                    8,               // keep_recent for tier 1
+                    tool_result_cap, // tool result budget for tier 2
+                    self.agent.config.compaction.safety_margin,
+                );
+                if tier > 0 {
+                    debug!(
+                        tier = tier,
+                        urgency = ?urgency,
+                        "Context recovered via tier {} compaction (streaming)", tier
+                    );
+                }
+                session.messages = recovered;
+            }
+        }
+
+        // Pass an empty user_input: the current user message is already in session.
+        let memory_override = self.agent.build_memory_override(&resolved_user_prompt).await;
+        let mut messages = self
+            .agent
+            .build_resolved_messages(msg, &session, memory_override.as_deref())
+            .await;
+
+        let tool_definitions = {
+            let tools = self.agent.tools.read().await;
+            tools.definitions_for_mode(
+                self.agent.config.agents.defaults.lazy_tool_schema,
+                self.agent.config.agents.defaults.compact_tools,
+            )
+        };
+
+        // Pre-flight context guard (streaming)
+        if let Some(ref monitor) = self.agent.context_monitor {
+            match monitor.preflight_check(&mut messages, &tool_definitions) {
+                PreflightAction::Ok => {}
+                PreflightAction::Trimmed => {
+                    debug!("Pre-flight guard trimmed oversized tool results (streaming)");
+                    sync_trimmed_tool_results(&mut session.messages, &messages);
+                }
+                PreflightAction::NeedsCompaction => {
+                    warn!("Pre-flight guard: context too large, triggering emergency compaction (streaming)");
+                    let context_limit = self.agent.config.compaction.context_limit;
+                    let tool_result_cap = self.agent.config.agents.defaults.max_tool_result_bytes;
+                    let (recovered, _tier) =
+                        crate::agent::compaction::try_recover_context_with_urgency(
+                            session.messages,
+                            context_limit,
+                            CompactionUrgency::Emergency,
+                            5,
+                            tool_result_cap,
+                            self.agent.config.compaction.safety_margin,
+                        );
+                    session.messages = recovered;
+                    messages = self
+                        .agent
+                        .build_resolved_messages(msg, &session, memory_override.as_deref())
+                        .await;
+                }
+            }
+        }
+
+        let options = ChatOptions::new()
+            .with_max_tokens(self.agent.config.agents.defaults.max_tokens)
+            .with_temperature(self.agent.config.agents.defaults.temperature);
+        let model_string = self.agent.resolve_model_for_message(msg);
+        let model = Some(model_string.as_str());
+
+        // Check token budget before first LLM call
+        if self.agent.token_budget.is_exceeded() {
+            return Err(ZeptoError::Provider(format!(
+                "Token budget exceeded: {}",
+                self.agent.token_budget.summary()
+            )));
+        }
+
+        if let Some(tx) = self.agent.tool_feedback_tx.read().await.as_ref() {
+            let _ = tx.send(ToolFeedback {
+                tool_name: String::new(),
+                phase: ToolFeedbackPhase::Thinking,
+                args_json: None,
+            });
+        }
+        let thinking_scope =
+            ThinkingScope::start(Arc::clone(&self.agent.bus), &msg.channel, &msg.chat_id).await;
+
+        // First call: non-streaming to see if there are tool calls, with overflow retry
+        let mut response = {
+            let max_retries = self.agent.config.compaction.overflow_retries;
+            let mut last_messages = messages;
+            let mut last_tool_defs = tool_definitions;
+            let mut result = provider
+                .chat(
+                    last_messages.clone(),
+                    last_tool_defs.clone(),
+                    model,
+                    options.clone(),
+                )
+                .await;
+
+            let mut attempt = 0u32;
+            while let Err(ref e) = result {
+                if !AgentLoop::is_context_overflow(e) || attempt >= max_retries {
+                    break;
+                }
+                if self.agent.context_monitor.is_none() {
+                    break; // compaction disabled
+                }
+                warn!(
+                    attempt = attempt + 1,
+                    max = max_retries,
+                    "Context overflow (streaming), compacting and retrying"
+                );
+                let urgency = AgentLoop::overflow_retry_urgency(attempt);
+                let ctx_limit = self.agent.config.compaction.context_limit;
+                let cap = self.agent.config.agents.defaults.max_tool_result_bytes;
+                let (recovered, _) = crate::agent::compaction::try_recover_context_with_urgency(
+                    session.messages,
+                    ctx_limit,
+                    urgency,
+                    8,
+                    cap,
+                    self.agent.config.compaction.safety_margin,
+                );
+                session.messages = recovered;
+                last_messages = self
+                    .agent
+                    .build_resolved_messages(msg, &session, memory_override.as_deref())
+                    .await;
+                last_tool_defs = {
+                    let tools = self.agent.tools.read().await;
+                    tools.definitions_for_mode(
+                        self.agent.config.agents.defaults.lazy_tool_schema,
+                        self.agent.config.agents.defaults.compact_tools,
+                    )
+                };
+                result = provider
+                    .chat(
+                        last_messages.clone(),
+                        last_tool_defs.clone(),
+                        model,
+                        options.clone(),
+                    )
+                    .await;
+                attempt += 1;
+            }
+            result?
+        };
+        if let Some(tx) = self.agent.tool_feedback_tx.read().await.as_ref() {
+            let _ = tx.send(ToolFeedback {
+                tool_name: String::new(),
+                phase: ToolFeedbackPhase::ThinkingDone,
+                args_json: None,
+            });
+        }
+        let thinking_detail = build_thinking_detail(&response);
+        thinking_scope.finish(thinking_detail.as_deref()).await;
+        if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref()) {
+            metrics.record_tokens_with_cache(
+                usage.prompt_tokens as u64,
+                usage.completion_tokens as u64,
+                usage.cached_tokens as u64,
+                usage.cache_creation_tokens as u64,
+            );
+        }
+        if let Some(usage) = response.usage.as_ref() {
+            metrics_collector.record_tokens_with_cache(
+                usage.prompt_tokens as u64,
+                usage.completion_tokens as u64,
+                usage.cached_tokens as u64,
+                usage.cache_creation_tokens as u64,
+            );
+            self.agent.token_budget
+                .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+        }
+
+        // User message was already added to session before build_messages above.
+
+        // Tool loop (non-streaming)
+        let max_iterations = self.agent.config.agents.defaults.max_tool_iterations;
+        let mut iteration = 0;
+        let mut tool_limit_hit = false;
+        let mut chain_tracker = crate::safety::chain_alert::ChainTracker::new();
+        let mut loop_guard = if self.agent.config.agents.defaults.loop_guard.enabled {
+            Some(LoopGuard::new(
+                self.agent.config.agents.defaults.loop_guard.clone(),
+            ))
+        } else {
+            None
+        };
+
+        while response.has_tool_calls() && iteration < max_iterations {
+            iteration += 1;
+            debug!("Tool iteration {} of {}", iteration, max_iterations);
+
+            // Enforce tool call limit BEFORE adding assistant message to session
+            // (streaming path). Same rationale as non-streaming: avoids orphaned
+            // tool-call messages and keeps transcript consistent.
+            if self.agent.tool_call_limit.is_exceeded() {
+                info!(
+                    count = self.agent.tool_call_limit.count(),
+                    limit = ?self.agent.tool_call_limit.limit(),
+                    "Tool call limit already reached, skipping streaming tool execution"
+                );
+                break;
+            }
+            if let Some(remaining) = self.agent.tool_call_limit.remaining() {
+                let allowed = remaining as usize;
+                if allowed < response.tool_calls.len() {
+                    info!(
+                        batch_size = response.tool_calls.len(),
+                        remaining = allowed,
+                        "Truncating streaming tool call batch to remaining budget"
+                    );
+                    response.tool_calls.truncate(allowed);
+                }
+            }
+
+            if let Some(metrics) = usage_metrics.as_ref() {
+                metrics.record_tool_calls(response.tool_calls.len() as u64);
+            }
+
+            // Add assistant message with tool calls (post-truncation).
+            // Some OpenAI-compatible providers also echo provider-specific
+            // tool-call markup in `content`; the structured tool_calls are
+            // the source of truth, so keep that markup out of future prompts.
+            session.add_message(assistant_message_with_tool_calls(&response.tool_calls));
+
+            let workspace = self.agent.config.workspace_path();
+            let workspace_str = workspace.to_string_lossy();
+            let tool_ctx = ToolContext::new()
+                .with_channel(&msg.channel, &msg.chat_id)
+                .with_workspace(&workspace_str)
+                .with_batch(msg.metadata.get("is_batch").is_some_and(|v| v == "true"));
+
+            let approval_gate = Arc::clone(&self.agent.approval_gate);
+            let approval_handler = self.agent.approval_handler.read().await.clone();
+            let safety_layer_stream = self.agent.safety_layer.clone();
+            let taint_engine_stream = self.agent.taint.clone();
+            let hook_engine = Arc::new(
+                crate::hooks::HookEngine::new(self.agent.config.hooks.clone())
+                    .with_bus(Arc::clone(&self.agent.bus)),
+            );
+
+            // Compute dynamic tool result budget based on remaining context space
+            let current_tokens_stream = ContextMonitor::estimate_tokens_with_margin(
+                &session.messages,
+                self.agent.config.compaction.safety_margin,
+            );
+            let context_limit_stream = self.agent.config.compaction.context_limit;
+            let max_result_bytes_stream = self.agent.config.agents.defaults.max_tool_result_bytes;
+            let result_budget_stream =
+                crate::utils::sanitize::compute_tool_result_budget_with_share(
+                    context_limit_stream,
+                    current_tokens_stream,
+                    response.tool_calls.len(),
+                    max_result_bytes_stream,
+                    self.agent.config.compaction.single_tool_result_share,
+                );
+
+            let tool_feedback_tx = self.agent.tool_feedback_tx.clone();
+            #[cfg(feature = "panel")]
+            let event_bus_clone_stream = self.agent.event_bus.clone();
+            let is_dry_run_stream = self.agent.dry_run.load(Ordering::SeqCst);
+            let current_agent_mode_stream = self.agent.agent_mode;
+            let trusted_local_session = is_trusted_local_session(msg);
+            let lazy_tool_schema = self.agent.config.agents.defaults.lazy_tool_schema;
+            let any_approval_gated_tool = if approval_handler.is_some() {
+                let guard = self.agent.tools.read().await;
+                response.tool_calls.iter().any(|tool_call| {
+                    let name = resolve_tool_call_name(&guard, &tool_call.name, lazy_tool_schema).0;
+                    approval_gate.requires_approval(&name)
+                })
+            } else {
+                false
+            };
+
+            let run_sequential = (!trusted_local_session
+                && approval_handler.is_some()
+                && any_approval_gated_tool)
+                || needs_sequential_execution(&self.agent.tools, &response.tool_calls, lazy_tool_schema)
+                    .await;
+            let tool_timeout_secs = if self.agent.config.agents.defaults.tool_timeout_secs > 0 {
+                self.agent.config.agents.defaults.tool_timeout_secs
+            } else {
+                self.agent.config.agents.defaults.agent_timeout_secs
+            };
+            let tool_timeout = std::time::Duration::from_secs(tool_timeout_secs.max(1));
+
+            // Clone inbound metadata for routing propagation in tool `for_user` messages.
+            let inbound_metadata_stream = msg.metadata.clone();
+
+            let tool_futures: Vec<_> = response
+                .tool_calls
+                .iter()
+                .map(|tool_call| {
+                    let tools = Arc::clone(&self.agent.tools);
+                    let ctx = tool_ctx.clone();
+                    let name = tool_call.name.clone();
+                    let id = tool_call.id.clone();
+                    let raw_args = tool_call.arguments.clone();
+                    let usage_metrics = usage_metrics.clone();
+                    let metrics_collector = Arc::clone(&metrics_collector);
+                    let gate = Arc::clone(&approval_gate);
+                    let approval_handler = approval_handler.clone();
+                    let thread_identity = self.agent.thread_identity();
+                    let hooks = Arc::clone(&hook_engine);
+                    let safety = safety_layer_stream.clone();
+                    let taint = taint_engine_stream.clone();
+                    let budget = result_budget_stream;
+                    let tool_feedback_tx = tool_feedback_tx.clone();
+                    #[cfg(feature = "panel")]
+                    let event_bus = event_bus_clone_stream.clone();
+                    let dry_run = is_dry_run_stream;
+                    let agent_mode = current_agent_mode_stream;
+                    let bus_for_tools = Arc::clone(&self.agent.bus);
+                    let inbound_meta = inbound_metadata_stream.clone();
+
+                    async move {
+                        let args: serde_json::Value = match serde_json::from_str(&raw_args) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(tool = %name, error = %e, "Invalid JSON in tool arguments");
+                                serde_json::json!({"_parse_error": format!("Invalid arguments JSON: {}", e)})
+                            }
+                        };
+                        let (name, exposed_name) = {
+                            let tools_guard = tools.read().await;
+                            resolve_tool_call_name(&tools_guard, &name, lazy_tool_schema)
+                        };
+
+                        if lazy_tool_schema {
+                            let validation_error = {
+                                let tools_guard = tools.read().await;
+                                tools_guard.validate_tool_args_lazy(&name, &args, &exposed_name)
+                            };
+                            if let Some(output) = validation_error {
+                                if let Some(metrics) = usage_metrics.as_ref() {
+                                    metrics.record_tool_validation_failure();
+                                }
+                                return ToolObservation::pre_execution(
+                                    id,
+                                    name,
+                                    output.for_llm,
+                                    ToolObservationKind::SoftError,
+                                );
+                            }
+                            if name == "get_tool_schema" {
+                                if let Some(metrics) = usage_metrics.as_ref() {
+                                    metrics.record_tool_schema_retrieval();
+                                }
+                            }
+                        }
+
+                        let channel_name = ctx.channel.as_deref().unwrap_or("cli");
+                        let chat_id = ctx.chat_id.as_deref().unwrap_or(channel_name);
+                        if let crate::hooks::HookResult::Block(msg) =
+                            hooks.before_tool(&name, &args, channel_name, chat_id)
+                        {
+                            return ToolObservation::pre_execution(
+                                id,
+                                name.clone(),
+                                format!("Tool '{}' blocked by hook: {}", name, msg),
+                                ToolObservationKind::HardError,
+                            );
+                        }
+
+                        // Agent mode enforcement — same fail-closed logic as non-streaming path.
+                        {
+                            let mode_policy = crate::security::ModePolicy::new(agent_mode);
+                            let tools_guard = tools.read().await;
+                            if let Some(tool) = tools_guard.get(&name) {
+                                let tool_category = tool.category();
+                                match mode_policy.check(tool_category) {
+                                    crate::security::CategoryPermission::Blocked => {
+                                        info!(tool = %name, mode = %agent_mode, category = ?tool_category, "Tool blocked by agent mode");
+                                        return ToolObservation::pre_execution(
+                                            id,
+                                            name.clone(),
+                                            format!(
+                                                "Tool '{}' is blocked in {} mode (category: {})",
+                                                name, agent_mode, tool_category
+                                            ),
+                                            ToolObservationKind::HardError,
+                                        );
+                                    }
+                                    crate::security::CategoryPermission::RequiresApproval => {
+                                        if trusted_local_session {
+                                            info!(tool = %name, mode = %agent_mode, category = ?tool_category, "Trusted local session bypassed approval-gated tool");
+                                        } else if !gate.requires_approval(&name) {
+                                            info!(tool = %name, mode = %agent_mode, category = ?tool_category, "Tool requires approval per agent mode");
+                                            return ToolObservation::pre_execution(
+                                                id,
+                                                name.clone(),
+                                                format!(
+                                                    "Tool '{}' requires approval in {} mode (category: {}). Not executed.",
+                                                    name, agent_mode, tool_category
+                                                ),
+                                                ToolObservationKind::ApprovalRequired,
+                                            );
+                                        }
+                                    }
+                                    crate::security::CategoryPermission::Allowed => {}
+                                }
+                            }
+                        }
+
+                        // Check approval gate before executing
+                        if !trusted_local_session {
+                            if let Some(message) = resolve_tool_approval(
+                                &gate,
+                                approval_handler.as_ref(),
+                                thread_identity.as_ref(),
+                                &name,
+                                &args,
+                                ctx.channel.as_deref(),
+                                ctx.chat_id.as_deref(),
+                            )
+                            .await
+                            {
+                                info!(tool = %name, "Tool requires approval, blocking execution");
+                                return ToolObservation::pre_execution(
+                                    id,
+                                    name,
+                                    message,
+                                    ToolObservationKind::ApprovalRequired,
+                                );
+                            }
+                        }
+
+                        // Dry-run mode: describe what would happen without executing
+                        if dry_run {
+                            return ToolObservation::pre_execution(
+                                id,
+                                name.clone(),
+                                AgentLoop::dry_run_result(&name, &args, &raw_args, budget),
+                                ToolObservationKind::Success,
+                            );
+                        }
+                        let file_artifact_candidate =
+                            prepare_file_artifact_candidate(&name, &args, &ctx);
+                        let pretty_args = prettify_tool_arguments(&raw_args);
+
+                        // Send tool starting feedback
+                        if let Some(tx) = tool_feedback_tx.read().await.as_ref() {
+                            let _ = tx.send(ToolFeedback {
+                                tool_name: name.clone(),
+                                phase: ToolFeedbackPhase::Starting,
+                                args_json: Some(raw_args.clone()),
+                            });
+                        }
+                        publish_tool_call_started_event(
+                            &bus_for_tools,
+                            &ctx,
+                            &id,
+                            &name,
+                            &pretty_args,
+                        )
+                        .await;
+                        #[cfg(feature = "panel")]
+                        if let Some(bus) = &event_bus {
+                            bus.send(crate::api::events::PanelEvent::ToolStarted {
+                                tool: name.clone(),
+                            });
+                        }
+                        let tool_start = std::time::Instant::now();
+                        let execution = std::panic::AssertUnwindSafe(async {
+                            let tools_guard = tools.read().await;
+                            crate::kernel::execute_tool(
+                                &tools_guard,
+                                &name,
+                                args,
+                                &ctx,
+                                safety.as_ref().map(|s| s.as_ref()),
+                                &metrics_collector,
+                                taint.as_ref().map(|t| t.as_ref()),
+                            )
+                            .await
+                        })
+                        .catch_unwind();
+                        // Phase 3: classify execution outcome — same
+                        // mapping as the non-streaming closure.
+                        let (result, success, tool_output, kind) =
+                            match tokio::time::timeout(tool_timeout, execution).await {
+                                Ok(Ok(Ok(output))) => {
+                                    let is_err = output.is_error;
+                                    let kind = if is_err {
+                                        ToolObservationKind::SoftError
+                                    } else {
+                                        ToolObservationKind::Success
+                                    };
+                                    let for_llm = output.for_llm.clone();
+                                    (for_llm, !is_err, Some(output), kind)
+                                }
+                                Ok(Ok(Err(e))) => (
+                                    format!("Error: {}", e),
+                                    false,
+                                    None,
+                                    ToolObservationKind::HardError,
+                                ),
+                                Ok(Err(_panic)) => {
+                                    error!(tool = %name, "Tool panicked during execution");
+                                    (
+                                        format!(
+                                            "Error: Tool '{}' panicked during execution",
+                                            name
+                                        ),
+                                        false,
+                                        None,
+                                        ToolObservationKind::HardError,
+                                    )
+                                }
+                                Err(_) => {
+                                    error!(tool = %name, timeout_secs = tool_timeout.as_secs(), "Tool execution timed out");
+                                    (
+                                        format!(
+                                            "Error: Tool '{}' timed out after {}s",
+                                            name,
+                                            tool_timeout.as_secs()
+                                        ),
+                                        false,
+                                        None,
+                                        ToolObservationKind::HardError,
+                                    )
+                            }
+                        };
+                        let pause = tool_output.as_ref().is_some_and(|o| o.pause_for_input);
+                        let elapsed = tool_start.elapsed();
+                        let latency_ms = elapsed.as_millis() as u64;
+                        let (sanitized_result, result_preview) =
+                            build_tool_result_payload(&result, budget);
+                        if let Some(output) = tool_output {
+                            // Send to user if tool opted in
+                            if let Some(ref user_msg) = output.for_user {
+                                let mut outbound = crate::bus::OutboundMessage::new(
+                                    ctx.channel.as_deref().unwrap_or(""),
+                                    ctx.chat_id.as_deref().unwrap_or(""),
+                                    user_msg,
+                                );
+                                // Propagate routing metadata (e.g. telegram_thread_id, telegram_message_id)
+                                if let Some(tid) = inbound_meta.get("telegram_thread_id") {
+                                    outbound
+                                        .metadata
+                                        .insert("telegram_thread_id".to_string(), tid.clone());
+                                }
+                                if let Some(mid) = inbound_meta.get("telegram_message_id") {
+                                    outbound
+                                        .metadata
+                                        .insert("telegram_message_id".to_string(), mid.clone());
+                                }
+                                // Keep typing indicator alive — agent is still working
+                                outbound
+                                    .metadata
+                                    .insert("keep_typing".to_string(), "true".to_string());
+                                let _ = bus_for_tools.publish_outbound(outbound).await;
+                            }
+                        }
+                        if success {
+                            if let Some(candidate) = file_artifact_candidate.as_ref() {
+                                if let Some(payload) = build_file_artifact_payload(candidate, &ctx) {
+                                    publish_file_artifact_event(&bus_for_tools, &ctx, &payload).await;
+                                }
+                            }
+                            debug!(tool = %name, latency_ms = latency_ms, "Tool executed successfully");
+                            hooks.after_tool(&name, &result, elapsed, channel_name, chat_id);
+                            if let Some(tx) = tool_feedback_tx.read().await.as_ref() {
+                                let _ = tx.send(ToolFeedback {
+                                    tool_name: name.clone(),
+                                    phase: ToolFeedbackPhase::Done {
+                                        elapsed_ms: latency_ms,
+                                    },
+                                    args_json: Some(raw_args.clone()),
+                                });
+                            }
+                            publish_tool_call_finished_event(
+                                &bus_for_tools,
+                                &ctx,
+                                &id,
+                                &name,
+                                ToolCallOutcome::Done,
+                                latency_ms,
+                                &pretty_args,
+                                &sanitized_result,
+                                result_preview.as_deref(),
+                            )
+                            .await;
+                            #[cfg(feature = "panel")]
+                            if let Some(bus) = &event_bus {
+                                bus.send(crate::api::events::PanelEvent::ToolDone {
+                                    tool: name.clone(),
+                                    duration_ms: latency_ms,
+                                });
+                            }
+                        } else {
+                            error!(tool = %name, latency_ms = latency_ms, error = %result, "Tool execution failed");
+                            hooks.on_error(&name, &result, channel_name, chat_id);
+                            if let Some(metrics) = usage_metrics.as_ref() {
+                                metrics.record_error();
+                            }
+                            if let Some(tx) = tool_feedback_tx.read().await.as_ref() {
+                                let _ = tx.send(ToolFeedback {
+                                    tool_name: name.clone(),
+                                    phase: ToolFeedbackPhase::Failed {
+                                        elapsed_ms: latency_ms,
+                                        error: result.clone(),
+                                    },
+                                    args_json: Some(raw_args.clone()),
+                                });
+                            }
+                            publish_tool_call_finished_event(
+                                &bus_for_tools,
+                                &ctx,
+                                &id,
+                                &name,
+                                ToolCallOutcome::Failed { raw_error: &result },
+                                latency_ms,
+                                &pretty_args,
+                                &sanitized_result,
+                                result_preview.as_deref(),
+                            )
+                            .await;
+                            #[cfg(feature = "panel")]
+                            if let Some(bus) = &event_bus {
+                                bus.send(crate::api::events::PanelEvent::ToolFailed {
+                                    tool: name.clone(),
+                                    error: result.clone(),
+                                });
+                            }
+                        }
+                        ToolObservation::new(
+                            id,
+                            name,
+                            sanitized_result,
+                            kind,
+                            latency_ms,
+                            pause,
+                        )
+                    }
+                })
+                .collect();
+
+            let results = if run_sequential {
+                let mut out = Vec::with_capacity(tool_futures.len());
+                for fut in tool_futures {
+                    out.push(fut.await);
+                }
+                out
+            } else {
+                futures::future::join_all(tool_futures).await
+            };
+
+            // Record tool names for chain alerting (streaming path)
+            let tool_names: Vec<String> = response
+                .tool_calls
+                .iter()
+                .map(|tc| tc.name.clone())
+                .collect();
+            chain_tracker.record(&tool_names);
+            let results: Vec<ToolObservation> = results;
+            let should_pause = results.iter().any(|obs| obs.pause_for_input);
+            for obs in &results {
+                session.add_message(Message::tool_result(&obs.call_id, &obs.content));
+            }
+
+            // In-loop compaction: check if tool results pushed context over threshold
+            if let Some(ref monitor) = self.agent.context_monitor {
+                if let Some(urgency) = monitor.urgency(&session.messages) {
+                    debug!(urgency = ?urgency, "In-loop compaction triggered after tool results (streaming)");
+                    let ctx_limit = self.agent.config.compaction.context_limit;
+                    let cap = self.agent.config.agents.defaults.max_tool_result_bytes;
+                    let (recovered, tier) =
+                        crate::agent::compaction::try_recover_context_with_urgency(
+                            session.messages,
+                            ctx_limit,
+                            urgency,
+                            8,
+                            cap,
+                            self.agent.config.compaction.safety_margin,
+                        );
+                    if tier > 0 {
+                        debug!(
+                            tier = tier,
+                            "In-loop context recovered via tier {} (streaming)", tier
+                        );
+                    }
+                    session.messages = recovered;
+                }
+            }
+
+            if should_pause {
+                break;
+            }
+
+            // Increment tool call counter after execution.
+            self.agent.tool_call_limit
+                .increment(response.tool_calls.len() as u32);
+            // If the limit is now hit, clear tool_calls so the post-loop code
+            // enters the streaming final call branch, which re-issues the
+            // conversation (with tool results in session) as a proper streamed
+            // response instead of returning the stale tool-call stub.
+            if self.agent.tool_call_limit.is_exceeded() {
+                info!(
+                    count = self.agent.tool_call_limit.count(),
+                    limit = ?self.agent.tool_call_limit.limit(),
+                    "Tool call limit reached, proceeding to final streaming synthesis"
+                );
+                tool_limit_hit = true;
+                response.tool_calls.clear();
+                break;
+            }
+
+            if let Some(guard) = loop_guard.as_mut() {
+                if check_loop_guard(guard, &response.tool_calls, &mut session) {
+                    response.content =
+                        "Stopped tool loop due to repeated tool-call pattern.".to_string();
+                    break;
+                }
+
+                // Record outcomes for outcome-aware blocking.
+                let results_for_guard: Vec<(String, String)> = results
+                    .iter()
+                    .map(|obs| (obs.call_id.clone(), obs.content.clone()))
+                    .collect();
+                if check_loop_guard_outcomes(
+                    guard,
+                    &response.tool_calls,
+                    &results_for_guard,
+                    &mut session,
+                ) {
+                    response.content =
+                        "Stopped tool loop due to repeated identical outcomes.".to_string();
+                    break;
+                }
+            }
+
+            let tool_definitions = {
+                let tools = self.agent.tools.read().await;
+                tools.definitions_for_mode(
+                    self.agent.config.agents.defaults.lazy_tool_schema,
+                    self.agent.config.agents.defaults.compact_tools,
+                )
+            };
+
+            // Check token budget before next LLM call
+            if self.agent.token_budget.is_exceeded() {
+                info!(budget = %self.agent.token_budget.summary(), "Token budget exceeded during streaming tool loop");
+                break;
+            }
+
+            let mut messages = self
+                .agent
+                .build_resolved_messages(msg, &session, memory_override.as_deref())
+                .await;
+
+            // Pre-flight context guard (streaming tool loop)
+            if let Some(ref monitor) = self.agent.context_monitor {
+                match monitor.preflight_check(&mut messages, &tool_definitions) {
+                    PreflightAction::Ok => {}
+                    PreflightAction::Trimmed => {
+                        debug!("Pre-flight guard trimmed tool results (streaming tool loop)");
+                        sync_trimmed_tool_results(&mut session.messages, &messages);
+                    }
+                    PreflightAction::NeedsCompaction => {
+                        warn!("Pre-flight: context too large in streaming tool loop, emergency compaction");
+                        let ctx_limit = self.agent.config.compaction.context_limit;
+                        let cap = self.agent.config.agents.defaults.max_tool_result_bytes;
+                        let (recovered, _) =
+                            crate::agent::compaction::try_recover_context_with_urgency(
+                                session.messages,
+                                ctx_limit,
+                                CompactionUrgency::Emergency,
+                                5,
+                                cap,
+                                self.agent.config.compaction.safety_margin,
+                            );
+                        session.messages = recovered;
+                        messages = self
+                            .agent
+                            .build_resolved_messages(msg, &session, memory_override.as_deref())
+                            .await;
+                    }
+                }
+            }
+
+            if let Some(tx) = self.agent.tool_feedback_tx.read().await.as_ref() {
+                let _ = tx.send(ToolFeedback {
+                    tool_name: String::new(),
+                    phase: ToolFeedbackPhase::Thinking,
+                    args_json: None,
+                });
+            }
+            let thinking_scope =
+                ThinkingScope::start(Arc::clone(&self.agent.bus), &msg.channel, &msg.chat_id).await;
+
+            response = {
+                let max_retries = self.agent.config.compaction.overflow_retries;
+                let mut last_messages = messages;
+                let mut last_tool_defs = tool_definitions;
+                let mut result = provider
+                    .chat(
+                        last_messages.clone(),
+                        last_tool_defs.clone(),
+                        model,
+                        options.clone(),
+                    )
+                    .await;
+                let mut attempt = 0u32;
+                while let Err(ref e) = result {
+                    if !AgentLoop::is_context_overflow(e) || attempt >= max_retries {
+                        break;
+                    }
+                    if self.agent.context_monitor.is_none() {
+                        break; // compaction disabled
+                    }
+                    warn!(
+                        attempt = attempt + 1,
+                        max = max_retries,
+                        "Context overflow in streaming tool loop, compacting and retrying"
+                    );
+                    let urgency = AgentLoop::overflow_retry_urgency(attempt);
+                    let ctx_limit = self.agent.config.compaction.context_limit;
+                    let cap = self.agent.config.agents.defaults.max_tool_result_bytes;
+                    let (recovered, _) = crate::agent::compaction::try_recover_context_with_urgency(
+                        session.messages,
+                        ctx_limit,
+                        urgency,
+                        8,
+                        cap,
+                        self.agent.config.compaction.safety_margin,
+                    );
+                    session.messages = recovered;
+                    last_messages = self
+                        .agent
+                        .build_resolved_messages(msg, &session, memory_override.as_deref())
+                        .await;
+                    last_tool_defs = {
+                        let tools = self.agent.tools.read().await;
+                        tools.definitions_for_mode(
+                            self.agent.config.agents.defaults.lazy_tool_schema,
+                            self.agent.config.agents.defaults.compact_tools,
+                        )
+                    };
+                    result = provider
+                        .chat(
+                            last_messages.clone(),
+                            last_tool_defs.clone(),
+                            model,
+                            options.clone(),
+                        )
+                        .await;
+                    attempt += 1;
+                }
+                result?
+            };
+            if let Some(tx) = self.agent.tool_feedback_tx.read().await.as_ref() {
+                let _ = tx.send(ToolFeedback {
+                    tool_name: String::new(),
+                    phase: ToolFeedbackPhase::ThinkingDone,
+                    args_json: None,
+                });
+            }
+            let thinking_detail = build_thinking_detail(&response);
+            thinking_scope.finish(thinking_detail.as_deref()).await;
+            if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref())
+            {
+                metrics.record_tokens_with_cache(
+                    usage.prompt_tokens as u64,
+                    usage.completion_tokens as u64,
+                    usage.cached_tokens as u64,
+                    usage.cache_creation_tokens as u64,
+                );
+            }
+            if let Some(usage) = response.usage.as_ref() {
+                metrics_collector.record_tokens_with_cache(
+                    usage.prompt_tokens as u64,
+                    usage.completion_tokens as u64,
+                    usage.cached_tokens as u64,
+                    usage.cache_creation_tokens as u64,
+                );
+                self.agent.token_budget
+                    .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+            }
+        }
+
+        if let Some(tx) = self.agent.tool_feedback_tx.read().await.as_ref() {
+            let _ = tx.send(ToolFeedback {
+                tool_name: String::new(),
+                phase: ToolFeedbackPhase::ResponseReady,
+                args_json: None,
+            });
+        }
+
+        // Final call: if no more tool calls, use streaming
+        if !response.has_tool_calls() {
+            // Re-issue the final call via chat_stream.
+            // If the tool call limit was hit, pass empty tools so the model
+            // cannot emit further tool calls after the cap was enforced.
+            let messages = self
+                .agent
+                .build_resolved_messages(msg, &session, memory_override.as_deref())
+                .await;
+
+            // Final streaming call: tools are intentionally omitted. By
+            // contract the tool loop above has already exhausted every
+            // tool decision the model wanted to make, so this call is
+            // supposed to emit the user-visible answer only. Leaving
+            // tools in the catalog tempts providers (OpenAI, DeepSeek,
+            // Claude) to emit StreamEvent::ToolCalls mid-stream — a
+            // legitimate model behaviour we then mis-handled as a hard
+            // failure (`Provider error: unexpected tool calls in final
+            // streaming call`). Force the empty catalog so that path is
+            // structurally unreachable. `tool_limit_hit` is left in
+            // scope for future logging hooks; behavioural parity with
+            // the prior tool-limit branch is preserved.
+            let tool_definitions: Vec<crate::providers::ToolDefinition> = Vec::new();
+            let _ = tool_limit_hit;
+
+            // Signal that tools are done and response is ready (streaming path)
+            if let Some(tx) = self.agent.tool_feedback_tx.read().await.as_ref() {
+                let _ = tx.send(ToolFeedback {
+                    tool_name: String::new(),
+                    phase: ToolFeedbackPhase::ResponseReady,
+                    args_json: None,
+                });
+            }
+
+            // Phase 2 state-machine refactor: clone synthesis pre-requisites
+            // so the spawned forwarder task can invoke `run_final_synthesis`
+            // without holding `&self`. Clones are taken here, before
+            // `messages` / `options` are moved into `chat_stream`, so the
+            // synthesis call sees exactly the same context as the final
+            // streaming call.
+            let synthesis_provider = Arc::clone(&provider);
+            let synthesis_messages = messages.clone();
+            let synthesis_model = model.map(str::to_string);
+            let synthesis_options = options.clone();
+            let synthesis_on_empty =
+                self.agent.config.agents.defaults.final_synthesis_on_empty;
+
+            let stream_rx = provider
+                .chat_stream(messages, tool_definitions, model, options)
+                .await?;
+
+            // Wrap in a forwarding task that also saves the session
+            let (out_tx, out_rx) = tokio::sync::mpsc::channel::<StreamEvent>(32);
+            let session_manager = Arc::clone(&self.agent.session_manager);
+            let session_clone = session.clone();
+            let usage_metrics = usage_metrics.clone();
+            let metrics_collector = Arc::clone(&metrics_collector);
+
+            tokio::spawn(async move {
+                let mut session = session_clone;
+                let mut stream_rx = stream_rx;
+                // Phase 1 state-machine refactor (streaming guard): hold
+                // back content that *starts* with `<` until Done has been
+                // classified, so provider tool markup (e.g.
+                // `<minimax:tool_call>`) cannot be rendered to the user
+                // before the final classification verdict says it is safe.
+                let mut markup_guard = StreamingMarkupGuard::new();
+
+                while let Some(event) = stream_rx.recv().await {
+                    match event {
+                        StreamEvent::Done { content, usage } => {
+                            if let Some(usage_ref) = usage.as_ref() {
+                                if let Some(metrics) = usage_metrics.as_ref() {
+                                    metrics.record_tokens_with_cache(
+                                        usage_ref.prompt_tokens as u64,
+                                        usage_ref.completion_tokens as u64,
+                                        usage_ref.cached_tokens as u64,
+                                        usage_ref.cache_creation_tokens as u64,
+                                    );
+                                }
+                                metrics_collector.record_tokens_with_cache(
+                                    usage_ref.prompt_tokens as u64,
+                                    usage_ref.completion_tokens as u64,
+                                    usage_ref.cached_tokens as u64,
+                                    usage_ref.cache_creation_tokens as u64,
+                                );
+                            }
+                            // Classify the streamed final content. Only
+                            // FinalAnswer is persisted to the session and
+                            // forwarded as Done. Empty / provider-markup-only
+                            // payloads optionally trigger one tools-disabled
+                            // synthesis turn (phase 2); on success its
+                            // output is flushed as a single Delta + Done,
+                            // otherwise the channel sees StreamEvent::Error.
+                            let content_len = content.len();
+                            let outcome = classify_final_content(&content);
+                            match outcome {
+                                TurnOutcome::FinalAnswer(_) => {
+                                    // Flush any content the guard withheld
+                                    // because it started with `<`. The
+                                    // classification verdict confirmed it is
+                                    // a legitimate answer (not markup), so
+                                    // forward it now as a single Delta
+                                    // before the terminating Done.
+                                    if let Some(buffered) = markup_guard.take_buffered() {
+                                        let _ = out_tx
+                                            .send(StreamEvent::Delta(buffered))
+                                            .await;
+                                    }
+                                    session.add_message(Message::assistant(&content));
+                                    let _ = session_manager.save(&session).await;
+                                    let _ = out_tx
+                                        .send(StreamEvent::Done { content, usage })
+                                        .await;
+                                }
+                                bad_outcome @ (TurnOutcome::EmptyAnswer
+                                | TurnOutcome::ProviderMarkupOnly) => {
+                                    let (reason, user_error_msg) = match bad_outcome {
+                                        TurnOutcome::EmptyAnswer => (
+                                            "empty_answer",
+                                            "模型返回了空白最终答案。请重试或缩小任务范围。",
+                                        ),
+                                        TurnOutcome::ProviderMarkupOnly => (
+                                            "provider_markup",
+                                            "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。",
+                                        ),
+                                        _ => unreachable!(),
+                                    };
+                                    if synthesis_on_empty {
+                                        tracing::warn!(
+                                            content_len,
+                                            buffered = markup_guard.is_buffering(),
+                                            reason,
+                                            "agent_turn(streaming): final content unusable, running synthesis"
+                                        );
+                                        match crate::agent::synthesis::run_final_synthesis(
+                                            synthesis_provider,
+                                            synthesis_messages,
+                                            synthesis_model,
+                                            synthesis_options,
+                                        )
+                                        .await
+                                        {
+                                            Ok(synth_resp) => match classify_final_content(
+                                                &synth_resp.content,
+                                            ) {
+                                                TurnOutcome::FinalAnswer(synth_text) => {
+                                                    session.add_message(Message::assistant(
+                                                        &synth_text,
+                                                    ));
+                                                    let _ = session_manager
+                                                        .save(&session)
+                                                        .await;
+                                                    let synth_clone = synth_text.clone();
+                                                    let _ = out_tx
+                                                        .send(StreamEvent::Delta(synth_text))
+                                                        .await;
+                                                    let _ = out_tx
+                                                        .send(StreamEvent::Done {
+                                                            content: synth_clone,
+                                                            usage: synth_resp.usage,
+                                                        })
+                                                        .await;
+                                                }
+                                                TurnOutcome::EmptyAnswer
+                                                | TurnOutcome::ProviderMarkupOnly => {
+                                                    tracing::warn!(
+                                                        reason,
+                                                        "agent_turn(streaming): synthesis also produced unusable answer"
+                                                    );
+                                                    let _ = out_tx
+                                                        .send(StreamEvent::Error(
+                                                            ZeptoError::Provider(
+                                                                user_error_msg.to_string(),
+                                                            ),
+                                                        ))
+                                                        .await;
+                                                }
+                                                TurnOutcome::ToolCalls(_) => unreachable!(),
+                                            },
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    reason,
+                                                    error = %e,
+                                                    "agent_turn(streaming): synthesis call failed"
+                                                );
+                                                let _ = out_tx
+                                                    .send(StreamEvent::Error(
+                                                        ZeptoError::Provider(
+                                                            user_error_msg.to_string(),
+                                                        ),
+                                                    ))
+                                                    .await;
+                                            }
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            content_len,
+                                            buffered = markup_guard.is_buffering(),
+                                            reason,
+                                            "agent_turn(streaming): final content unusable, synthesis disabled"
+                                        );
+                                        let _ = out_tx
+                                            .send(StreamEvent::Error(ZeptoError::Provider(
+                                                user_error_msg.to_string(),
+                                            )))
+                                            .await;
+                                    }
+                                }
+                                TurnOutcome::ToolCalls(_) => unreachable!(
+                                    "classify_final_content cannot return ToolCalls"
+                                ),
+                            }
+                            return;
+                        }
+                        StreamEvent::ToolCalls(tool_calls) => {
+                            // Unexpected tool calls during streaming — emit and let caller handle
+                            let _ =
+                                out_tx.send(StreamEvent::ToolCalls(tool_calls)).await;
+                            return;
+                        }
+                        StreamEvent::Delta(text) => {
+                            // Route through the markup guard. Returns
+                            // Some(chunk) when the guard is satisfied the
+                            // chunk is safe to forward (streaming mode,
+                            // or the initial leading-whitespace flush), or
+                            // None while it is still withholding content.
+                            if let Some(forward) = markup_guard.on_delta(&text) {
+                                if out_tx
+                                    .send(StreamEvent::Delta(forward))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        other @ StreamEvent::Error(_) => {
+                            if out_tx.send(other).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+
+            Ok(out_rx)
+        } else {
+            // Still has tool calls after max iterations — no `chat_stream`
+            // call was issued; the user-visible payload is whatever the
+            // tool-loop response contained. Phase 2: attempt one
+            // tools-disabled synthesis turn before failing.
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let cfg_defaults = &self.agent.config.agents.defaults;
+            let initial_outcome = classify_final_content(&response.content);
+            let trigger = classify_synthesis_trigger(
+                &initial_outcome,
+                true,
+                cfg_defaults.final_synthesis_on_empty,
+                cfg_defaults.final_synthesis_on_tool_limit,
+            );
+
+            let (outcome, done_usage) = if let Some(label) = trigger {
+                info!(
+                    trigger = label,
+                    tool_call_count = response.tool_calls.len(),
+                    "agent_turn(streaming): running final synthesis at max iter"
+                );
+                let synth_messages = self
+                    .agent
+                    .build_resolved_messages(msg, &session, memory_override.as_deref())
+                    .await;
+                let synth_options = ChatOptions::new()
+                    .with_max_tokens(cfg_defaults.max_tokens)
+                    .with_temperature(cfg_defaults.temperature);
+                let synth_model = Some(cfg_defaults.model.clone());
+                match crate::agent::synthesis::run_final_synthesis(
+                    Arc::clone(&provider),
+                    synth_messages,
+                    synth_model,
+                    synth_options,
+                )
+                .await
+                {
+                    Ok(resp) => (classify_final_content(&resp.content), resp.usage),
+                    Err(e) => {
+                        warn!(
+                            trigger = label,
+                            error = %e,
+                            "agent_turn(streaming): synthesis at max iter failed; falling back"
+                        );
+                        (initial_outcome, response.usage.clone())
+                    }
+                }
+            } else {
+                (initial_outcome, response.usage.clone())
+            };
+
+            match outcome {
+                TurnOutcome::FinalAnswer(text) => {
+                    session.add_message(Message::assistant(&text));
+                    self.agent.session_manager.save(&session).await?;
+                    let _ = tx
+                        .send(StreamEvent::Done {
+                            content: text,
+                            usage: done_usage,
+                        })
+                        .await;
+                }
+                TurnOutcome::EmptyAnswer => {
+                    warn!(
+                        tool_call_count = response.tool_calls.len(),
+                        "agent_turn(streaming): empty final answer at max iter after synthesis attempt"
+                    );
+                    let _ = tx
+                        .send(StreamEvent::Error(ZeptoError::Provider(
+                            "模型返回了空白最终答案。请重试或缩小任务范围。".to_string(),
+                        )))
+                        .await;
+                }
+                TurnOutcome::ProviderMarkupOnly => {
+                    warn!(
+                        "agent_turn(streaming): provider tool markup at max iter after synthesis attempt"
+                    );
+                    let _ = tx
+                        .send(StreamEvent::Error(ZeptoError::Provider(
+                            "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。"
+                                .to_string(),
+                        )))
+                        .await;
+                }
+                TurnOutcome::ToolCalls(_) => unreachable!(
+                    "classify_final_content cannot return ToolCalls"
+                ),
+            }
+            Ok(rx)
         }
     }
 }
