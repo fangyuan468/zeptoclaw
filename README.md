@@ -178,7 +178,7 @@ Baseline reference numbers on current `production`:
 
 - `cargo test --lib --quiet`: **3719 passed, 0 failed, 5 ignored**
 - `cargo test --doc agent`: **22 passed, 0 failed, 7 ignored**
-- `cargo clippy --lib --all-targets`: 0 new warnings (6 pre-existing in `runtime/factory.rs`)
+- `cargo clippy --lib --all-targets`: 0 new warnings (6 pre-existing across `runtime/factory.rs`, `agent/context_monitor.rs`, `gateway/container_agent.rs`, `kernel/gate.rs`)
 
 ### Code map (delta vs. upstream)
 
