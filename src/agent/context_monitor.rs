@@ -690,6 +690,7 @@ mod tests {
             single_tool_result_share: 0.40,
             safety_margin: 1.3,
             overflow_retries: 5,
+            anchored_summary: Default::default(),
         };
         let monitor = ContextMonitor::from_config(&config);
         assert_eq!(monitor.context_budget(), 35_000); // 50_000 * 0.70
@@ -712,6 +713,7 @@ mod tests {
             single_tool_result_share: 0.90,
             safety_margin: 1.0, // no margin for precise control
             overflow_retries: 3,
+            anchored_summary: Default::default(),
         };
         let monitor = ContextMonitor::from_config(&config);
         // budget = 200 * 0.75 = 150 tokens
