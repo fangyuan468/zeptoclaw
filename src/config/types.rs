@@ -460,30 +460,26 @@ pub struct CompactionConfig {
     pub overflow_retries: u32,
     /// Anchored rolling summary configuration (token-cost-optimization §P5).
     ///
-    /// P5.1 lands the configuration surface and the underlying capability
-    /// (`compaction::try_anchored_summary` + `ContextBuilder::with_anchored_summary`)
-    /// but does not yet invoke them — `enabled = false` by default and no
-    /// caller in the agent loop reads `anchor_step` / `target_tokens` /
-    /// `summary_model` yet. P5.2 will wire these into the Harness state and
-    /// the prompt build path.
+    /// P5.2 wires this into the Harness state and prompt build path. It
+    /// remains disabled by default so existing deployments keep full-history
+    /// prompts unless explicitly opted in.
     #[serde(default)]
     pub anchored_summary: AnchoredSummaryConfig,
 }
 
 /// Anchored rolling summary configuration.
 ///
-/// Disabled by default. P5.1 only adds the schema and the underlying
-/// capability; P5.2 wires it into the Harness turn loop.
+/// Disabled by default. When enabled, the Harness periodically summarizes the
+/// already-anchored prefix and keeps the recent active window as raw messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AnchoredSummaryConfig {
     /// Whether anchored rolling summary is enabled. Default: false.
     pub enabled: bool,
-    /// Number of turns between summary refreshes (reserved for P5.2 —
-    /// not consulted by anything in P5.1). Default: 8.
+    /// Number of messages between summary refreshes and the size of the recent
+    /// active window kept as raw history. Default: 8.
     pub anchor_step: usize,
-    /// Soft target token count for the produced summary (reserved for
-    /// P5.2 — not consulted by anything in P5.1). Default: 1024.
+    /// Soft target token count for the produced summary. Default: 1024.
     pub target_tokens: usize,
     /// Optional cheaper model identifier used solely for summary
     /// generation. `None` falls back to the turn's main model.
