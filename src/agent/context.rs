@@ -802,9 +802,9 @@ impl ContextBuilder {
     /// (token-cost-optimization §P5).
     ///
     /// When `Some(text)`, `build_messages_with_overrides` inserts one
-    /// extra `Message::system(text)` right after the main system
-    /// message and before history. `None` (default) keeps the prompt
-    /// byte-for-byte identical to pre-P5.1.
+    /// extra `Message::system("[Conversation Summary]\n{text}")`
+    /// right after the main system message and before history. `None`
+    /// (default) keeps the prompt byte-for-byte identical to pre-P5.1.
     ///
     /// P5.1 ships this method dormant — no caller in `agent::loop` or
     /// `agent::harness` sets it yet. P5.2 wires it up.
