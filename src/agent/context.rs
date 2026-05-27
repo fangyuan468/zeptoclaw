@@ -770,8 +770,16 @@ impl ContextBuilder {
         // LLM treats it as authoritative compressed context. P5.1 keeps
         // this dormant (`anchored_summary` is always `None` in current
         // callers); P5.2 wires the Harness to populate it.
+        //
+        // The `[Conversation Summary]\n` prefix matches
+        // `compaction::summarize_messages` so the two summary code paths
+        // emit byte-identical envelopes and the LLM sees one stable
+        // anchor header regardless of which path produced the summary.
         if let Some(summary) = &self.anchored_summary {
-            messages.push(Message::system(summary));
+            messages.push(Message::system(&format!(
+                "[Conversation Summary]\n{}",
+                summary
+            )));
         }
         messages.extend(history.iter().cloned());
         if !user_input.is_empty() {
@@ -1822,7 +1830,7 @@ mod tests {
     fn p5_build_with_overrides_inserts_summary_between_system_and_history() {
         let history = vec![Message::user("hi"), Message::assistant("hello")];
         let messages = ContextBuilder::new()
-            .with_anchored_summary(Some("[summary] previous turns covered X, Y, Z.".into()))
+            .with_anchored_summary(Some("previous turns covered X, Y, Z.".into()))
             .build_messages_with_overrides(
                 &history,
                 "next",
@@ -1834,10 +1842,13 @@ mod tests {
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].role, Role::System);
+        // Envelope must match `compaction::summarize_messages` byte-for-byte
+        // so both summary code paths share the same anchor header.
         assert_eq!(
             messages[1].content,
-            "[summary] previous turns covered X, Y, Z."
+            "[Conversation Summary]\nprevious turns covered X, Y, Z."
         );
+        assert!(messages[1].content.starts_with("[Conversation Summary]\n"));
         assert_eq!(messages[2].role, Role::User);
         assert_eq!(messages[2].content, "hi");
         assert_eq!(messages[3].role, Role::Assistant);
