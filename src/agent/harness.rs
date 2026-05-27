@@ -57,6 +57,47 @@ pub(super) struct Harness<'a> {
     pub(super) agent: &'a AgentLoop,
 }
 
+const PHASE0_FALLBACK_CONTENT: &str = "Sorry, I could not produce a displayable final answer for this turn. Please retry, or make the task more specific so I can continue from the tool results already gathered.";
+
+fn phase0_fallback_message(
+    fallback_reason: &str,
+    iterations: u32,
+    tool_calls_total: u32,
+    tool_limit_hit: bool,
+) -> Message {
+    let mut message = Message::assistant(PHASE0_FALLBACK_CONTENT);
+    message
+        .metadata
+        .insert("harness_fallback".to_string(), serde_json::json!("phase0"));
+    message.metadata.insert(
+        "fallback_reason".to_string(),
+        serde_json::json!(fallback_reason),
+    );
+    message
+        .metadata
+        .insert("iterations".to_string(), serde_json::json!(iterations));
+    message.metadata.insert(
+        "tool_calls_total".to_string(),
+        serde_json::json!(tool_calls_total),
+    );
+    message.metadata.insert(
+        "tool_limit_hit".to_string(),
+        serde_json::json!(tool_limit_hit),
+    );
+    message
+}
+
+fn phase0_fallback_reason(outcome: &TurnOutcome, synthesis_failed: bool) -> &'static str {
+    if synthesis_failed {
+        return "synthesis_error";
+    }
+    match outcome {
+        TurnOutcome::EmptyAnswer => "synthesis_empty",
+        TurnOutcome::ProviderMarkupOnly => "synthesis_markup",
+        TurnOutcome::FinalAnswer(_) | TurnOutcome::ToolCalls(_) => "tool_limit_hit",
+    }
+}
+
 impl<'a> Harness<'a> {
     pub(super) fn new(agent: &'a AgentLoop) -> Self {
         Self { agent }
@@ -471,6 +512,7 @@ impl<'a> Harness<'a> {
         // Tool loop
         let max_iterations = self.agent.config.agents.defaults.max_tool_iterations;
         let mut iteration = 0;
+        let mut tool_calls_total = 0u32;
         let mut chain_tracker = crate::safety::chain_alert::ChainTracker::new();
         let mut loop_guard = if self.agent.config.agents.defaults.loop_guard.enabled {
             Some(LoopGuard::new(
@@ -510,6 +552,7 @@ impl<'a> Harness<'a> {
             }
 
             // Record metrics AFTER truncation so counts reflect actual execution.
+            tool_calls_total += response.tool_calls.len() as u32;
             if let Some(metrics) = usage_metrics.as_ref() {
                 metrics.record_tool_calls(response.tool_calls.len() as u64);
             }
@@ -1331,6 +1374,7 @@ impl<'a> Harness<'a> {
         // enabled, run one tools-disabled synthesis turn before deciding
         // the final outcome. The synthesis result is itself classified, so
         // an empty / markup-only synthesis response still fails explicitly.
+        let mut synthesis_failed = false;
         let outcome = if let Some(trigger) = synthesis_trigger {
             let provider_opt = self
                 .agent
@@ -1364,6 +1408,7 @@ impl<'a> Harness<'a> {
                     {
                         Ok(resp) => classify_final_content(&resp.content),
                         Err(e) => {
+                            synthesis_failed = true;
                             warn!(
                                 trigger = trigger,
                                 error = %e,
@@ -1374,6 +1419,7 @@ impl<'a> Harness<'a> {
                     }
                 }
                 None => {
+                    synthesis_failed = true;
                     warn!(
                         trigger = trigger,
                         "agent_turn: final synthesis configured but no provider attached; falling back to initial outcome"
@@ -1391,25 +1437,45 @@ impl<'a> Harness<'a> {
                 self.agent.session_manager.save(&session).await?;
                 Ok(text)
             }
-            TurnOutcome::EmptyAnswer => {
+            bad_outcome @ TurnOutcome::EmptyAnswer => {
+                let fallback_reason = phase0_fallback_reason(&bad_outcome, synthesis_failed);
                 warn!(
                     iterations = iteration,
-                    tool_call_count = response.tool_calls.len(),
-                    "agent_turn: empty final answer after synthesis attempt"
+                    tool_calls_total,
+                    tool_limit_hit = max_iter_reached,
+                    fallback_reason,
+                    harness_fallback = "phase0",
+                    "agent_turn: empty final answer after synthesis attempt; returning phase0 fallback"
                 );
-                Err(ZeptoError::Provider(
-                    "模型返回了空白最终答案。请重试或缩小任务范围。".to_string(),
-                ))
+                let fallback = phase0_fallback_message(
+                    fallback_reason,
+                    iteration,
+                    tool_calls_total,
+                    max_iter_reached,
+                );
+                session.add_message(fallback);
+                self.agent.session_manager.save(&session).await?;
+                Ok(PHASE0_FALLBACK_CONTENT.to_string())
             }
-            TurnOutcome::ProviderMarkupOnly => {
+            bad_outcome @ TurnOutcome::ProviderMarkupOnly => {
+                let fallback_reason = phase0_fallback_reason(&bad_outcome, synthesis_failed);
                 warn!(
                     iterations = iteration,
-                    "agent_turn: provider tool markup leaked into final content after synthesis attempt"
+                    tool_calls_total,
+                    tool_limit_hit = max_iter_reached,
+                    fallback_reason,
+                    harness_fallback = "phase0",
+                    "agent_turn: provider tool markup leaked into final content after synthesis attempt; returning phase0 fallback"
                 );
-                Err(ZeptoError::Provider(
-                    "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。"
-                        .to_string(),
-                ))
+                let fallback = phase0_fallback_message(
+                    fallback_reason,
+                    iteration,
+                    tool_calls_total,
+                    max_iter_reached,
+                );
+                session.add_message(fallback);
+                self.agent.session_manager.save(&session).await?;
+                Ok(PHASE0_FALLBACK_CONTENT.to_string())
             }
             TurnOutcome::ToolCalls(_) => unreachable!(
                 "classify_final_content cannot return ToolCalls; only classify_turn_outcome can"
@@ -1694,6 +1760,7 @@ impl<'a> Harness<'a> {
         // Tool loop (non-streaming)
         let max_iterations = self.agent.config.agents.defaults.max_tool_iterations;
         let mut iteration = 0;
+        let mut tool_calls_total = 0u32;
         let mut tool_limit_hit = false;
         let mut chain_tracker = crate::safety::chain_alert::ChainTracker::new();
         let mut loop_guard = if self.agent.config.agents.defaults.loop_guard.enabled {
@@ -1734,6 +1801,7 @@ impl<'a> Harness<'a> {
             if let Some(metrics) = usage_metrics.as_ref() {
                 metrics.record_tool_calls(response.tool_calls.len() as u64);
             }
+            tool_calls_total += response.tool_calls.len() as u32;
 
             // Add assistant message with tool calls (post-truncation).
             // Some OpenAI-compatible providers also echo provider-specific
@@ -2462,6 +2530,9 @@ impl<'a> Harness<'a> {
             let session_clone = session.clone();
             let usage_metrics = usage_metrics.clone();
             let metrics_collector = Arc::clone(&metrics_collector);
+            let fallback_iterations = iteration;
+            let fallback_tool_calls_total = tool_calls_total;
+            let fallback_tool_limit_hit = tool_limit_hit;
 
             tokio::spawn(async move {
                 let mut session = session_clone;
@@ -2522,15 +2593,9 @@ impl<'a> Harness<'a> {
                                 }
                                 bad_outcome @ (TurnOutcome::EmptyAnswer
                                 | TurnOutcome::ProviderMarkupOnly) => {
-                                    let (reason, user_error_msg) = match bad_outcome {
-                                        TurnOutcome::EmptyAnswer => (
-                                            "empty_answer",
-                                            "模型返回了空白最终答案。请重试或缩小任务范围。",
-                                        ),
-                                        TurnOutcome::ProviderMarkupOnly => (
-                                            "provider_markup",
-                                            "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。",
-                                        ),
+                                    let reason = match &bad_outcome {
+                                        TurnOutcome::EmptyAnswer => "empty_answer",
+                                        TurnOutcome::ProviderMarkupOnly => "provider_markup",
                                         _ => unreachable!(),
                                     };
                                     if synthesis_on_empty {
@@ -2555,9 +2620,7 @@ impl<'a> Harness<'a> {
                                                     session.add_message(Message::assistant(
                                                         &synth_text,
                                                     ));
-                                                    let _ = session_manager
-                                                        .save(&session)
-                                                        .await;
+                                                    let _ = session_manager.save(&session).await;
                                                     let synth_clone = synth_text.clone();
                                                     let _ = out_tx
                                                         .send(StreamEvent::Delta(synth_text))
@@ -2569,48 +2632,96 @@ impl<'a> Harness<'a> {
                                                         })
                                                         .await;
                                                 }
-                                                TurnOutcome::EmptyAnswer
-                                                | TurnOutcome::ProviderMarkupOnly => {
+                                                synth_bad @ (TurnOutcome::EmptyAnswer
+                                                | TurnOutcome::ProviderMarkupOnly) => {
+                                                    let fallback_reason =
+                                                        phase0_fallback_reason(&synth_bad, false);
                                                     tracing::warn!(
                                                         reason,
-                                                        "agent_turn(streaming): synthesis also produced unusable answer"
+                                                        fallback_reason,
+                                                        iterations = fallback_iterations,
+                                                        tool_calls_total =
+                                                            fallback_tool_calls_total,
+                                                        tool_limit_hit =
+                                                            fallback_tool_limit_hit,
+                                                        harness_fallback = "phase0",
+                                                        "agent_turn(streaming): synthesis also produced unusable answer; returning phase0 fallback"
                                                     );
+                                                    let fallback = phase0_fallback_message(
+                                                        fallback_reason,
+                                                        fallback_iterations,
+                                                        fallback_tool_calls_total,
+                                                        fallback_tool_limit_hit,
+                                                    );
+                                                    session.add_message(fallback);
+                                                    let _ = session_manager.save(&session).await;
                                                     let _ = out_tx
-                                                        .send(StreamEvent::Error(
-                                                            ZeptoError::Provider(
-                                                                user_error_msg.to_string(),
-                                                            ),
-                                                        ))
+                                                        .send(StreamEvent::Done {
+                                                            content: PHASE0_FALLBACK_CONTENT
+                                                                .to_string(),
+                                                            usage: synth_resp.usage,
+                                                        })
                                                         .await;
                                                 }
                                                 TurnOutcome::ToolCalls(_) => unreachable!(),
                                             },
                                             Err(e) => {
+                                                let fallback_reason =
+                                                    phase0_fallback_reason(&bad_outcome, true);
                                                 tracing::warn!(
                                                     reason,
                                                     error = %e,
-                                                    "agent_turn(streaming): synthesis call failed"
+                                                    fallback_reason,
+                                                    iterations = fallback_iterations,
+                                                    tool_calls_total = fallback_tool_calls_total,
+                                                    tool_limit_hit = fallback_tool_limit_hit,
+                                                    harness_fallback = "phase0",
+                                                    "agent_turn(streaming): synthesis call failed; returning phase0 fallback"
                                                 );
+                                                let fallback = phase0_fallback_message(
+                                                    fallback_reason,
+                                                    fallback_iterations,
+                                                    fallback_tool_calls_total,
+                                                    fallback_tool_limit_hit,
+                                                );
+                                                session.add_message(fallback);
+                                                let _ = session_manager.save(&session).await;
                                                 let _ = out_tx
-                                                    .send(StreamEvent::Error(
-                                                        ZeptoError::Provider(
-                                                            user_error_msg.to_string(),
-                                                        ),
-                                                    ))
+                                                    .send(StreamEvent::Done {
+                                                        content: PHASE0_FALLBACK_CONTENT
+                                                            .to_string(),
+                                                        usage,
+                                                    })
                                                     .await;
                                             }
                                         }
                                     } else {
+                                        let fallback_reason =
+                                            phase0_fallback_reason(&bad_outcome, false);
                                         tracing::warn!(
                                             content_len,
                                             buffered = markup_guard.is_buffering(),
                                             reason,
-                                            "agent_turn(streaming): final content unusable, synthesis disabled"
+                                            fallback_reason,
+                                            iterations = fallback_iterations,
+                                            tool_calls_total = fallback_tool_calls_total,
+                                            tool_limit_hit = fallback_tool_limit_hit,
+                                            harness_fallback = "phase0",
+                                            "agent_turn(streaming): final content unusable, synthesis disabled; returning phase0 fallback"
                                         );
+                                        let fallback = phase0_fallback_message(
+                                            fallback_reason,
+                                            fallback_iterations,
+                                            fallback_tool_calls_total,
+                                            fallback_tool_limit_hit,
+                                        );
+                                        session.add_message(fallback);
+                                        let _ = session_manager.save(&session).await;
                                         let _ = out_tx
-                                            .send(StreamEvent::Error(ZeptoError::Provider(
-                                                user_error_msg.to_string(),
-                                            )))
+                                            .send(StreamEvent::Done {
+                                                content: PHASE0_FALLBACK_CONTENT.to_string(),
+                                                usage,
+                                            })
                                             .await;
                                     }
                                 }
@@ -2667,6 +2778,7 @@ impl<'a> Harness<'a> {
                 cfg_defaults.final_synthesis_on_tool_limit,
             );
 
+            let mut synthesis_failed = false;
             let (outcome, done_usage) = if let Some(label) = trigger {
                 info!(
                     trigger = label,
@@ -2691,6 +2803,7 @@ impl<'a> Harness<'a> {
                 {
                     Ok(resp) => (classify_final_content(&resp.content), resp.usage),
                     Err(e) => {
+                        synthesis_failed = true;
                         warn!(
                             trigger = label,
                             error = %e,
@@ -2714,26 +2827,46 @@ impl<'a> Harness<'a> {
                         })
                         .await;
                 }
-                TurnOutcome::EmptyAnswer => {
+                bad_outcome @ TurnOutcome::EmptyAnswer => {
+                    let fallback_reason = phase0_fallback_reason(&bad_outcome, synthesis_failed);
                     warn!(
-                        tool_call_count = response.tool_calls.len(),
-                        "agent_turn(streaming): empty final answer at max iter after synthesis attempt"
+                        iterations = iteration,
+                        tool_calls_total,
+                        tool_limit_hit = true,
+                        fallback_reason,
+                        harness_fallback = "phase0",
+                        "agent_turn(streaming): empty final answer at max iter after synthesis attempt; returning phase0 fallback"
                     );
+                    let fallback =
+                        phase0_fallback_message(fallback_reason, iteration, tool_calls_total, true);
+                    session.add_message(fallback);
+                    self.agent.session_manager.save(&session).await?;
                     let _ = tx
-                        .send(StreamEvent::Error(ZeptoError::Provider(
-                            "模型返回了空白最终答案。请重试或缩小任务范围。".to_string(),
-                        )))
+                        .send(StreamEvent::Done {
+                            content: PHASE0_FALLBACK_CONTENT.to_string(),
+                            usage: done_usage,
+                        })
                         .await;
                 }
-                TurnOutcome::ProviderMarkupOnly => {
+                bad_outcome @ TurnOutcome::ProviderMarkupOnly => {
+                    let fallback_reason = phase0_fallback_reason(&bad_outcome, synthesis_failed);
                     warn!(
-                        "agent_turn(streaming): provider tool markup at max iter after synthesis attempt"
+                        iterations = iteration,
+                        tool_calls_total,
+                        tool_limit_hit = true,
+                        fallback_reason,
+                        harness_fallback = "phase0",
+                        "agent_turn(streaming): provider tool markup at max iter after synthesis attempt; returning phase0 fallback"
                     );
+                    let fallback =
+                        phase0_fallback_message(fallback_reason, iteration, tool_calls_total, true);
+                    session.add_message(fallback);
+                    self.agent.session_manager.save(&session).await?;
                     let _ = tx
-                        .send(StreamEvent::Error(ZeptoError::Provider(
-                            "模型未生成可展示的最终答案(只返回了内部工具调用标记)。请重试。"
-                                .to_string(),
-                        )))
+                        .send(StreamEvent::Done {
+                            content: PHASE0_FALLBACK_CONTENT.to_string(),
+                            usage: done_usage,
+                        })
                         .await;
                 }
                 TurnOutcome::ToolCalls(_) => unreachable!(

@@ -282,8 +282,8 @@ mod tests {
 
     #[test]
     fn test_truncate_output_multibyte() {
-        // Each '日' is 3 bytes. Slicing by byte index would panic at the char boundary.
-        let long = "日".repeat(100_000);
+        // Each Euro sign is 3 bytes. Slicing by byte index would panic at the char boundary.
+        let long = "\u{20AC}".repeat(100_000);
         let result = PdfReadTool::truncate_output(long, 50_000);
         assert!(
             result.contains("[TRUNCATED]"),

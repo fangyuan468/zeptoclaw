@@ -1,4 +1,4 @@
-# Skill: Xiaohongshu (小红书)
+# Skill: Xiaohongshu (Little Red Book)
 
 Publish and search content on Xiaohongshu via MCP tools.
 

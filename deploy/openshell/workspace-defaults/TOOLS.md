@@ -25,7 +25,7 @@ Rules:
 
 ---
 
-## Xiaohongshu (小红书) — via MCP
+## Xiaohongshu (Little Red Book) — via MCP
 
 All Xiaohongshu tools are prefixed with `xiaohongshu_` and called as regular tool calls.
 
@@ -121,4 +121,4 @@ Fallback:
 
 ### Cookie Expiration
 
-When any tool returns an error containing "Cookie 已过期", tell the user their cookies have expired and ask them to provide new cookies from their browser.
+When any tool returns an error containing "Cookie has expired", tell the user their cookies have expired and ask them to provide new cookies from their browser.

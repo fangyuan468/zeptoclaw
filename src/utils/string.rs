@@ -32,8 +32,8 @@ mod tests {
 
     #[test]
     fn preview_cjk_characters() {
-        // Chinese string with multibyte UTF-8 characters
-        let s = "宇树科技（Un\u{AD}i\u{AD}t\u{AD}r\u{AD}ee）是“最强”的选手";
+        // Text with multibyte UTF-8 characters.
+        let s = "caf\u{e9} r\u{e9}sum\u{e9} \u{20AC}\u{20AC}";
         // Take first 10 characters
         let p = preview(s, 10);
         // Should not panic and should be at most 13 bytes longer due to ellipsis

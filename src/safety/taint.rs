@@ -784,10 +784,10 @@ mod tests {
 
     #[test]
     fn test_truncate_utf8_multibyte() {
-        // Each CJK character is 3 bytes in UTF-8
-        let s = "\u{4e16}\u{754c}"; // "世界" = 6 bytes
-        assert_eq!(truncate_utf8(s, 4), "\u{4e16}"); // 3 bytes fits, 4th would split
-        assert_eq!(truncate_utf8(s, 3), "\u{4e16}"); // exact boundary
+        // Each Euro sign is 3 bytes in UTF-8.
+        let s = "\u{20AC}\u{20AC}"; // 6 bytes
+        assert_eq!(truncate_utf8(s, 4), "\u{20AC}"); // 3 bytes fits, 4th would split
+        assert_eq!(truncate_utf8(s, 3), "\u{20AC}"); // exact boundary
         assert_eq!(truncate_utf8(s, 2), ""); // can't fit even one char at 2 bytes
         assert_eq!(truncate_utf8(s, 6), s); // exact fit
     }

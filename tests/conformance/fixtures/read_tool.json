@@ -15,9 +15,9 @@
     },
     {
       "name": "read_unicode_content",
-      "setup": [{"type": "create_file", "path": "test.txt", "content": "こんにちは世界"}],
+      "setup": [{"type": "create_file", "path": "test.txt", "content": "caf\u00e9 r\u00e9sum\u00e9"}],
       "input": {"path": "test.txt"},
-      "expected": {"is_error": false, "output_exact": "こんにちは世界"}
+      "expected": {"is_error": false, "output_exact": "caf\u00e9 r\u00e9sum\u00e9"}
     },
     {
       "name": "read_empty_file",

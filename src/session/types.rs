@@ -3,6 +3,8 @@
 //! This module defines the core types for session and conversation management,
 //! including messages, roles, and tool calls.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -163,6 +165,9 @@ pub struct Message {
     /// ID of the tool call this message is responding to (for tool results)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Machine-readable per-message metadata for observability and clients.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 impl Message {
@@ -187,6 +192,7 @@ impl Message {
             }],
             tool_calls: None,
             tool_call_id: None,
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -211,6 +217,7 @@ impl Message {
             }],
             tool_calls: None,
             tool_call_id: None,
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -237,6 +244,7 @@ impl Message {
             }],
             tool_calls: None,
             tool_call_id: None,
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -265,6 +273,7 @@ impl Message {
             }],
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -291,6 +300,7 @@ impl Message {
             }],
             tool_calls: Some(tool_calls),
             tool_call_id: None,
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -306,6 +316,7 @@ impl Message {
             content_parts: parts,
             tool_calls: None,
             tool_call_id: None,
+            metadata: BTreeMap::new(),
         }
     }
 

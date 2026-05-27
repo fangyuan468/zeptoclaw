@@ -2408,7 +2408,7 @@ mod tests {
 
     #[test]
     fn test_read_loop_parses_headers_with_partial_utf8_body() {
-        let body = "你好世界".repeat(1024);
+        let body = "\u{20AC}\u{20AC}\u{20AC}\u{20AC}".repeat(1024);
         let body_bytes = body.as_bytes();
         let headers = format!(
             "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -2450,7 +2450,7 @@ mod tests {
 
     #[test]
     fn test_read_loop_break_when_full_body_received() {
-        let body = "你好".to_string();
+        let body = "\u{20AC}\u{20AC}".to_string();
         let body_bytes = body.as_bytes();
         let headers = format!(
             "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
