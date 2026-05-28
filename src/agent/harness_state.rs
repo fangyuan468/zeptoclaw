@@ -21,6 +21,7 @@ pub(super) enum DisorderSignal {
     LoopGuard,
     SelfDoubt,
     PlanStagnation,
+    SubtaskBudget,
 }
 
 impl DisorderSignal {
@@ -31,6 +32,7 @@ impl DisorderSignal {
             Self::LoopGuard => "loop_guard",
             Self::SelfDoubt => "self_doubt",
             Self::PlanStagnation => "plan_stagnation",
+            Self::SubtaskBudget => "subtask_budget",
         }
     }
 }
@@ -86,6 +88,7 @@ struct Subtask {
     acceptance: String,
     tool_budget: u32,
     tool_calls_used: u32,
+    budget_advisory_injected: bool,
     status: SubtaskStatus,
 }
 
@@ -248,14 +251,15 @@ impl HarnessTurnState {
         })
     }
 
-    pub(super) fn take_disorder_advisory(&mut self) -> Option<(DisorderSignal, &'static str)> {
+    pub(super) fn take_disorder_advisory(&mut self) -> Option<(DisorderSignal, String)> {
         if self.disorder_advisory_injected {
             return None;
         }
         let signal = self.disorder_advisory_pending.take()?;
+        let advisory = self.render_disorder_advisory(signal);
         self.disorder_advisory_injected = true;
         self.disorder_advisory_awaiting_response = true;
-        Some((signal, DISORDER_ADVISORY))
+        Some((signal, advisory))
     }
 
     pub(super) fn note_llm_response_after_advisory(&mut self, used_plan_tool: bool) -> bool {
@@ -268,7 +272,9 @@ impl HarnessTurnState {
 
     pub(super) fn record_tool_calls(&mut self, tool_names: &[String]) {
         if let Some(plan) = self.plan.as_mut() {
-            plan.record_tool_calls(tool_names.len() as u32);
+            if plan.record_tool_calls(tool_names.len() as u32) {
+                self.mark_disorder(DisorderSignal::SubtaskBudget);
+            }
         }
 
         for name in tool_names {
@@ -344,6 +350,17 @@ impl HarnessTurnState {
     fn mark_disorder(&mut self, signal: DisorderSignal) {
         if !self.disorder_advisory_injected && self.disorder_advisory_pending.is_none() {
             self.disorder_advisory_pending = Some(signal);
+        }
+    }
+
+    fn render_disorder_advisory(&self, signal: DisorderSignal) -> String {
+        match signal {
+            DisorderSignal::SubtaskBudget => self
+                .plan
+                .as_ref()
+                .and_then(TurnPlan::render_budget_advisory)
+                .unwrap_or_else(|| DISORDER_ADVISORY.to_string()),
+            _ => DISORDER_ADVISORY.to_string(),
         }
     }
 
@@ -426,10 +443,23 @@ impl TurnPlan {
         Ok(())
     }
 
-    fn record_tool_calls(&mut self, count: u32) {
+    fn record_tool_calls(&mut self, count: u32) -> bool {
         if let Some(current) = self.subtasks.get_mut(self.current_subtask_idx) {
             current.tool_calls_used = current.tool_calls_used.saturating_add(count);
+            if current.tool_calls_used >= current.tool_budget && !current.budget_advisory_injected {
+                current.budget_advisory_injected = true;
+                return true;
+            }
         }
+        false
+    }
+
+    fn render_budget_advisory(&self) -> Option<String> {
+        let current = self.subtasks.get(self.current_subtask_idx)?;
+        Some(format!(
+            "Subtask \"{}\" has used its declared tool budget ({} calls used, budget {}). If you have enough information, call revise_plan with decision=complete_current. If you need more work, you may continue, or call revise_plan with decision=replace_plan to update the budget. This is a suggestion, not a restriction.",
+            current.description, current.tool_calls_used, current.tool_budget
+        ))
     }
 
     fn render(&self, heading: &str) -> String {
@@ -469,6 +499,7 @@ impl From<ProposedSubtask> for Subtask {
             acceptance: value.acceptance.trim().to_string(),
             tool_budget: value.tool_budget.clamp(1, MAX_TOOL_BUDGET),
             tool_calls_used: 0,
+            budget_advisory_injected: false,
             status: SubtaskStatus::Pending,
         }
     }
@@ -616,6 +647,80 @@ mod tests {
                 .0,
             DisorderSignal::PlanStagnation
         );
+    }
+
+    #[test]
+    fn subtask_budget_marks_advisory_when_plan_is_active() {
+        let mut state = HarnessTurnState::default();
+        state.handle_propose_plan(
+            "call_plan",
+            r#"{"subtasks":[{"description":"Search","acceptance":"Sources found","tool_budget":2}]}"#,
+            1,
+        );
+
+        state.record_tool_calls(&["web_search".to_string()]);
+        assert!(state.take_disorder_advisory().is_none());
+
+        state.record_tool_calls(&["web_fetch".to_string()]);
+
+        let advisory = state
+            .take_disorder_advisory()
+            .expect("subtask budget should trigger");
+        assert_eq!(advisory.0, DisorderSignal::SubtaskBudget);
+        assert!(advisory.1.contains("Subtask \"Search\""));
+        assert!(advisory.1.contains("budget 2"));
+        assert!(advisory.1.contains("suggestion, not a restriction"));
+    }
+
+    #[test]
+    fn subtask_budget_does_not_repeat_for_same_subtask() {
+        let mut state = HarnessTurnState::default();
+        state.handle_propose_plan(
+            "call_plan",
+            r#"{"subtasks":[{"description":"Search","acceptance":"Sources found","tool_budget":1}]}"#,
+            1,
+        );
+
+        state.record_tool_calls(&["web_search".to_string()]);
+        state.record_tool_calls(&["web_fetch".to_string()]);
+
+        assert_eq!(
+            state
+                .take_disorder_advisory()
+                .expect("subtask budget should trigger once")
+                .0,
+            DisorderSignal::SubtaskBudget
+        );
+        assert!(state.take_disorder_advisory().is_none());
+    }
+
+    #[test]
+    fn next_subtask_budget_starts_at_zero_after_complete_current() {
+        let mut state = HarnessTurnState::default();
+        state.handle_propose_plan(
+            "call_plan",
+            r#"{"subtasks":[{"description":"Search","acceptance":"Sources found","tool_budget":1},{"description":"Compare","acceptance":"Table ready","tool_budget":3}]}"#,
+            1,
+        );
+
+        state.record_tool_calls(&["web_search".to_string()]);
+        state.handle_revise_plan(
+            "call_revise",
+            r#"{"decision":"complete_current","reason":"sources found"}"#,
+            2,
+        );
+
+        let prompt = state.render_plan_prompt().expect("plan should render");
+        assert!(prompt.contains("[x] subtask 1: Search"));
+        assert!(prompt.contains("[>] subtask 2 (0/3 tool calls used): Compare"));
+    }
+
+    #[test]
+    fn subtask_budget_is_inactive_without_plan() {
+        let mut state = HarnessTurnState::default();
+        state.record_tool_calls(&["web_search".to_string(), "web_fetch".to_string()]);
+
+        assert!(state.take_disorder_advisory().is_none());
     }
 
     #[test]

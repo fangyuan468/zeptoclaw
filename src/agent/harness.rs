@@ -332,7 +332,7 @@ impl<'a> Harness<'a> {
         }
         if let Some((signal, advisory)) = turn_state.take_disorder_advisory() {
             metrics_collector.record_harness_disorder_advisory(signal.as_label());
-            messages.push(Message::system(advisory));
+            messages.push(Message::system(&advisory));
         }
     }
 
