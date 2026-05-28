@@ -528,12 +528,12 @@ mod tests {
 
     #[test]
     fn test_truncate_output_multibyte() {
-        // Each '日' is 3 bytes in UTF-8; 100 000 repetitions = 300 000 bytes.
-        let cjk_text = "日".repeat(100_000);
-        let result = DocxReadTool::truncate_output(cjk_text, DEFAULT_MAX_CHARS);
+        // Each CJK character is 3 bytes in UTF-8; 100 000 repetitions = 300 000 bytes.
+        let multibyte_text = "\u{65E5}".repeat(100_000);
+        let result = DocxReadTool::truncate_output(multibyte_text, DEFAULT_MAX_CHARS);
         assert!(
             result.contains("[TRUNCATED]"),
-            "CJK text exceeding max_chars should be marked [TRUNCATED]"
+            "multibyte text exceeding max_chars should be marked [TRUNCATED]"
         );
         // The body before the marker must be exactly DEFAULT_MAX_CHARS chars.
         let marker = "\n[TRUNCATED]";

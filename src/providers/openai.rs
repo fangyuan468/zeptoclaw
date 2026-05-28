@@ -228,7 +228,7 @@ struct OpenAIToolCallResponse {
 ///    SiliconFlow / DeepSeek. Some `base_url`-routed deployments may
 ///    still emit only this one (per
 ///    `docs/plans/doing/2026-05-21-token-cost-optimization.md` §6.2
-///    field-mapping table and §9 risk row "OpenAI 兼容字段不一致").
+///    field-mapping table and §9 risk row "OpenAI-compatible fields are inconsistent").
 ///
 /// `cached_tokens()` returns the **max** of the two so that whichever
 /// the upstream populates, the figure surfaces. If both are present

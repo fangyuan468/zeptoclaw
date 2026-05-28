@@ -1484,6 +1484,16 @@ mod tests {
         tool_args: &'static str,
     }
 
+    struct ToolLoopThenSynthesisProvider {
+        calls: std::sync::Mutex<u8>,
+        synthesis_content: &'static str,
+    }
+
+    struct ToolThenBadStreamProvider {
+        calls: std::sync::Mutex<u8>,
+        stream_content: &'static str,
+    }
+
     #[derive(Clone, Debug)]
     struct RecordedProviderCall {
         is_summary: bool,
@@ -1560,6 +1570,87 @@ mod tests {
                 let call_num = *calls as u32;
                 Ok(LLMResponse::text("done").with_usage(Usage::new(10 + call_num, call_num)))
             }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ToolLoopThenSynthesisProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _model: Option<&str>,
+            _options: ChatOptions,
+        ) -> Result<LLMResponse> {
+            let mut calls = self.calls.lock().expect("provider call counter poisoned");
+            *calls += 1;
+            if *calls <= 2 {
+                Ok(LLMResponse::with_tools(
+                    "",
+                    vec![LLMToolCall::new("call_1", "read_file", "{}")],
+                ))
+            } else {
+                Ok(LLMResponse::text(self.synthesis_content))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ToolThenBadStreamProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _model: Option<&str>,
+            _options: ChatOptions,
+        ) -> Result<LLMResponse> {
+            let mut calls = self.calls.lock().expect("provider call counter poisoned");
+            *calls += 1;
+            if *calls == 1 {
+                Ok(LLMResponse::with_tools(
+                    "",
+                    vec![LLMToolCall::new("call_1", "read_file", "{}")],
+                ))
+            } else {
+                Ok(LLMResponse::text("ready for final stream"))
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _model: Option<&str>,
+            _options: ChatOptions,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            let content = self.stream_content.to_string();
+            if !content.is_empty() {
+                let _ = tx.send(StreamEvent::Delta(content.clone())).await;
+            }
+            let _ = tx
+                .send(StreamEvent::Done {
+                    content,
+                    usage: None,
+                })
+                .await;
+            Ok(rx)
         }
     }
 
@@ -2500,6 +2591,136 @@ tail line
                 .is_some_and(|msg| msg.contains("Invalid arguments JSON")),
             "streaming path should preserve parse errors for downstream policy and tooling"
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_returns_phase0_fallback_for_synthesis_markup() {
+        let mut config = Config::default();
+        config.agents.defaults.max_tool_iterations = 1;
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolLoopThenSynthesisProvider {
+                calls: std::sync::Mutex::new(0),
+                synthesis_content: "<minimax:tool_call>{}</minimax:tool_call>",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "phase0-meta", "run a tool");
+        let content = agent
+            .process_message(&msg)
+            .await
+            .expect("phase0 fallback should be delivered as a normal response");
+
+        assert!(content.starts_with("Sorry, I could not produce a displayable final answer"));
+        let session = agent
+            .session_manager
+            .get_or_create("cli:phase0-meta")
+            .await
+            .expect("session should load");
+        let metadata = &session
+            .last_message()
+            .expect("fallback message should be saved")
+            .metadata;
+        assert_eq!(
+            metadata.get("harness_fallback").and_then(|v| v.as_str()),
+            Some("phase0")
+        );
+        assert_eq!(
+            metadata.get("fallback_reason").and_then(|v| v.as_str()),
+            Some("synthesis_markup")
+        );
+        assert_eq!(metadata.get("iterations").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            metadata.get("tool_calls_total").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            metadata.get("tool_limit_hit").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_streaming_returns_phase0_fallback_for_markup() {
+        let mut config = Config::default();
+        config.agents.defaults.final_synthesis_on_empty = false;
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolThenBadStreamProvider {
+                calls: std::sync::Mutex::new(0),
+                stream_content: "<minimax:tool_call>{}</minimax:tool_call>",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "phase0-stream-markup", "run a tool");
+        let stream = agent
+            .process_message_streaming(&msg)
+            .await
+            .expect("streaming message should succeed");
+        let (content, _) = collect_stream_done(stream).await;
+
+        assert!(content.starts_with("Sorry, I could not produce a displayable final answer"));
+    }
+
+    #[tokio::test]
+    async fn test_process_message_streaming_returns_phase0_fallback_for_empty() {
+        let mut config = Config::default();
+        config.agents.defaults.final_synthesis_on_empty = false;
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolThenBadStreamProvider {
+                calls: std::sync::Mutex::new(0),
+                stream_content: "",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "phase0-stream-empty", "run a tool");
+        let stream = agent
+            .process_message_streaming(&msg)
+            .await
+            .expect("streaming message should succeed");
+        let (content, _) = collect_stream_done(stream).await;
+
+        assert!(content.starts_with("Sorry, I could not produce a displayable final answer"));
     }
 
     #[tokio::test]

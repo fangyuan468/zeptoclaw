@@ -1028,7 +1028,7 @@ mod tests {
 
     #[test]
     fn test_preview_text_handles_multibyte_without_panicking() {
-        let text = "你".repeat(200);
+        let text = "\u{4F60}".repeat(200);
         let preview = preview_text(&text, 147);
 
         assert_eq!(preview.chars().count(), 150);

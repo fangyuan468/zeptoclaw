@@ -246,11 +246,11 @@ mod tests {
 
     #[test]
     fn test_truncate_value_cjk() {
-        // CJK chars are 3 bytes each
-        let s = "\u{4F60}\u{597D}\u{4E16}\u{754C}"; // 你好世界 = 12 bytes
+        // These CJK characters are 3 bytes each in UTF-8.
+        let s = "\u{4F60}\u{597D}\u{4E16}\u{754C}"; // 12 bytes
         let result = truncate_value(s, 7);
         assert!(result.ends_with("..."));
-        // 7 bytes = 2 full CJK chars (6 bytes) + partial, so boundary at 6
+        // 7 bytes = 2 full CJK characters (6 bytes) + partial, so boundary at 6.
         assert_eq!(result, "\u{4F60}\u{597D}...");
     }
 }

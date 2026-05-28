@@ -305,6 +305,7 @@ pub fn messages_from_openai(msgs: &[ChatMessage]) -> Result<Vec<Message>, String
                 content_parts: vec![crate::session::ContentPart::Text { text: content }],
                 tool_calls,
                 tool_call_id: m.tool_call_id.clone(),
+                metadata: Default::default(),
             })
         })
         .collect()
