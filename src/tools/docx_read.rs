@@ -528,8 +528,8 @@ mod tests {
 
     #[test]
     fn test_truncate_output_multibyte() {
-        // Each Euro sign is 3 bytes in UTF-8; 100 000 repetitions = 300 000 bytes.
-        let multibyte_text = "\u{20AC}".repeat(100_000);
+        // Each CJK character is 3 bytes in UTF-8; 100 000 repetitions = 300 000 bytes.
+        let multibyte_text = "\u{65E5}".repeat(100_000);
         let result = DocxReadTool::truncate_output(multibyte_text, DEFAULT_MAX_CHARS);
         assert!(
             result.contains("[TRUNCATED]"),

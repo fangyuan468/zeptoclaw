@@ -94,7 +94,7 @@ fn phase0_fallback_reason(outcome: &TurnOutcome, synthesis_failed: bool) -> &'st
     match outcome {
         TurnOutcome::EmptyAnswer => "synthesis_empty",
         TurnOutcome::ProviderMarkupOnly => "synthesis_markup",
-        TurnOutcome::FinalAnswer(_) | TurnOutcome::ToolCalls(_) => "tool_limit_hit",
+        TurnOutcome::FinalAnswer(_) | TurnOutcome::ToolCalls(_) => "unexpected_outcome",
     }
 }
 

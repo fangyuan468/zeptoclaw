@@ -25,7 +25,7 @@ Rules:
 
 ---
 
-## Xiaohongshu (Little Red Book) — via MCP
+## Xiaohongshu — via MCP
 
 All Xiaohongshu tools are prefixed with `xiaohongshu_` and called as regular tool calls.
 

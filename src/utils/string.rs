@@ -32,8 +32,8 @@ mod tests {
 
     #[test]
     fn preview_cjk_characters() {
-        // Text with multibyte UTF-8 characters.
-        let s = "caf\u{e9} r\u{e9}sum\u{e9} \u{20AC}\u{20AC}";
+        // Text with CJK multibyte UTF-8 characters.
+        let s = "\u{4F60}\u{597D}\u{4E16}\u{754C}\u{6D4B}\u{8BD5}\u{6587}\u{672C}\u{8F93}\u{5165}\u{8D85}\u{957F}";
         // Take first 10 characters
         let p = preview(s, 10);
         // Should not panic and should be at most 13 bytes longer due to ellipsis

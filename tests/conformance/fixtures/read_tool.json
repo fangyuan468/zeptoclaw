@@ -15,9 +15,9 @@
     },
     {
       "name": "read_unicode_content",
-      "setup": [{"type": "create_file", "path": "test.txt", "content": "caf\u00e9 r\u00e9sum\u00e9"}],
+      "setup": [{"type": "create_file", "path": "test.txt", "content": "\u3053\u3093\u306b\u3061\u306f\u4e16\u754c"}],
       "input": {"path": "test.txt"},
-      "expected": {"is_error": false, "output_exact": "caf\u00e9 r\u00e9sum\u00e9"}
+      "expected": {"is_error": false, "output_exact": "\u3053\u3093\u306b\u3061\u306f\u4e16\u754c"}
     },
     {
       "name": "read_empty_file",

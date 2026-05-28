@@ -847,8 +847,8 @@ fn spawn_broker_sweep(broker: Arc<ApprovalBroker>) {
 
 fn parse_approval_reply(content: &str) -> Option<bool> {
     match content.trim().to_lowercase().as_str() {
-        "yes" | "y" | "approve" => Some(true),
-        "no" | "n" | "deny" => Some(false),
+        "yes" | "y" | "approve" | "\u{662F}" => Some(true),
+        "no" | "n" | "deny" | "\u{5426}" => Some(false),
         _ => None,
     }
 }
@@ -1436,9 +1436,11 @@ mod tests {
         assert_eq!(parse_approval_reply("yes"), Some(true));
         assert_eq!(parse_approval_reply("y"), Some(true));
         assert_eq!(parse_approval_reply("approve"), Some(true));
+        assert_eq!(parse_approval_reply("\u{662F}"), Some(true));
         assert_eq!(parse_approval_reply("no"), Some(false));
         assert_eq!(parse_approval_reply("n"), Some(false));
         assert_eq!(parse_approval_reply("deny"), Some(false));
+        assert_eq!(parse_approval_reply("\u{5426}"), Some(false));
         // Batch suffix was intentionally removed — "yes all" no longer
         // means "approve every pending request".
         assert_eq!(parse_approval_reply("yes all"), None);
