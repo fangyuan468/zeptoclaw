@@ -22,6 +22,8 @@ use crate::session::Message;
 /// Mirrors the prompt drafted in plan §7.
 pub const SYNTHESIS_INSTRUCTION: &str = "You are producing the final user-facing answer. \
 Do not call tools. Use only the existing tool results and conversation context. \
+Return plain text only; do not emit XML, provider tool-call markup, or \
+any `final_answer` tool-call representation. \
 If evidence is incomplete or a source could not be fetched, say so explicitly. \
 Return a concise answer that directly satisfies the user's request.";
 
@@ -161,6 +163,14 @@ mod tests {
             last.content.starts_with("You are producing the final user-facing answer."),
             "last message should be the synthesis instruction, got: {}",
             last.content
+        );
+        assert!(
+            last.content.contains("Return plain text only"),
+            "synthesis instruction should require plain text"
+        );
+        assert!(
+            last.content.contains("provider tool-call markup"),
+            "synthesis instruction should reject provider tool-call markup"
         );
     }
 
