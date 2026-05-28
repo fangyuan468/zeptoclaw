@@ -2855,6 +2855,57 @@ tail line
             metadata.get("tool_limit_hit").and_then(|v| v.as_bool()),
             Some(true)
         );
+        assert_eq!(
+            agent.metrics_collector().harness_max_iter_reached_total(),
+            1
+        );
+        assert_eq!(
+            agent.metrics_collector().synthesis_legacy_invoked_total(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_streaming_records_max_iter_synthesis_metrics() {
+        let mut config = Config::default();
+        config.agents.defaults.max_tool_iterations = 1;
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolLoopThenSynthesisProvider {
+                calls: std::sync::Mutex::new(0),
+                synthesis_content: "streaming synthesized answer",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "stream-max-iter", "run a tool");
+        let stream = agent
+            .process_message_streaming(&msg)
+            .await
+            .expect("streaming message should succeed");
+        let (content, _) = collect_stream_done(stream).await;
+
+        assert_eq!(content, "streaming synthesized answer");
+        assert_eq!(
+            agent.metrics_collector().harness_max_iter_reached_total(),
+            1
+        );
+        assert_eq!(
+            agent.metrics_collector().synthesis_legacy_invoked_total(),
+            1
+        );
     }
 
     #[tokio::test]

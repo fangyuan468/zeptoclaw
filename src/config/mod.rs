@@ -1784,7 +1784,7 @@ mod tests {
         assert_eq!(config.agents.defaults.model, "claude-sonnet-4-6");
         assert_eq!(config.agents.defaults.max_tokens, 8192);
         assert_eq!(config.agents.defaults.temperature, 0.7);
-        assert_eq!(config.agents.defaults.max_tool_iterations, 20);
+        assert_eq!(config.agents.defaults.max_tool_iterations, 40);
         assert_eq!(config.agents.defaults.workspace, "~/.zeptoclaw/workspace");
         assert_eq!(config.gateway.host, "0.0.0.0");
         assert_eq!(config.gateway.port, 8080);
@@ -2289,7 +2289,7 @@ mod tests {
         let config = Config::load_from_path(&path).unwrap();
 
         // Should return defaults (check fields not affected by env var overrides)
-        assert_eq!(config.agents.defaults.max_tool_iterations, 20);
+        assert_eq!(config.agents.defaults.max_tool_iterations, 40);
         assert_eq!(config.agents.defaults.agent_timeout_secs, 300);
         assert!(!config.agents.defaults.model.is_empty());
     }

@@ -1713,6 +1713,7 @@ impl<'a> Harness<'a> {
 
         let max_iter_reached = iteration >= max_iterations && response.has_tool_calls();
         if max_iter_reached {
+            metrics_collector.record_harness_max_iter_reached();
             info!(
                 iterations = iteration,
                 "Tool loop reached maximum iterations, attempting final synthesis"
@@ -1797,10 +1798,11 @@ impl<'a> Harness<'a> {
             let provider_opt = self.agent.provider.read().await.as_ref().map(Arc::clone);
             match provider_opt {
                 Some(provider) => {
+                    metrics_collector.record_synthesis_legacy_invoked();
                     info!(
-                        trigger = trigger,
+                        reason = trigger,
                         iterations = iteration,
-                        "agent_turn: running final synthesis"
+                        "synthesis: legacy fallback invoked"
                     );
                     let synthesis_messages = self
                         .agent
@@ -3126,11 +3128,12 @@ impl<'a> Harness<'a> {
                                         _ => unreachable!(),
                                     };
                                     if synthesis_on_empty {
+                                        metrics_collector.record_synthesis_legacy_invoked();
                                         tracing::warn!(
                                             content_len,
                                             buffered = markup_guard.is_buffering(),
                                             reason,
-                                            "agent_turn(streaming): final content unusable, running synthesis"
+                                            "synthesis: legacy fallback invoked"
                                         );
                                         match crate::agent::synthesis::run_final_synthesis(
                                             synthesis_provider,
@@ -3290,6 +3293,9 @@ impl<'a> Harness<'a> {
             // call was issued; the user-visible payload is whatever the
             // tool-loop response contained. Phase 2: attempt one
             // tools-disabled synthesis turn before failing.
+            if iteration >= max_iterations {
+                metrics_collector.record_harness_max_iter_reached();
+            }
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let cfg_defaults = &self.agent.config.agents.defaults;
             let initial_outcome = classify_final_content(&response.content);
@@ -3302,10 +3308,11 @@ impl<'a> Harness<'a> {
 
             let mut synthesis_failed = false;
             let (outcome, done_usage) = if let Some(label) = trigger {
+                metrics_collector.record_synthesis_legacy_invoked();
                 info!(
-                    trigger = label,
+                    reason = label,
                     tool_call_count = response.tool_calls.len(),
-                    "agent_turn(streaming): running final synthesis at max iter"
+                    "synthesis: legacy fallback invoked"
                 );
                 let synth_messages = self
                     .agent

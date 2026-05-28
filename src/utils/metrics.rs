@@ -68,6 +68,10 @@ pub struct MetricsCollector {
     harness_disorder_advisory_total: Mutex<HashMap<String, u64>>,
     /// Number of injected disorder advisories followed by a response that did not use plan tools.
     harness_disorder_advisory_ignored_total: Mutex<u64>,
+    /// Number of turns that reached the max tool iteration crash guard.
+    harness_max_iter_reached_total: Mutex<u64>,
+    /// Number of times the legacy final synthesis fallback was invoked.
+    synthesis_legacy_invoked_total: Mutex<u64>,
 }
 
 impl MetricsCollector {
@@ -85,6 +89,8 @@ impl MetricsCollector {
             harness_plan_revised_total: Mutex::new(0),
             harness_disorder_advisory_total: Mutex::new(HashMap::new()),
             harness_disorder_advisory_ignored_total: Mutex::new(0),
+            harness_max_iter_reached_total: Mutex::new(0),
+            synthesis_legacy_invoked_total: Mutex::new(0),
         }
     }
 
@@ -167,6 +173,16 @@ impl MetricsCollector {
         *self.harness_disorder_advisory_ignored_total.lock().unwrap() += 1;
     }
 
+    /// Records that the max tool iteration crash guard was reached.
+    pub fn record_harness_max_iter_reached(&self) {
+        *self.harness_max_iter_reached_total.lock().unwrap() += 1;
+    }
+
+    /// Records that the legacy final synthesis fallback was invoked.
+    pub fn record_synthesis_legacy_invoked(&self) {
+        *self.synthesis_legacy_invoked_total.lock().unwrap() += 1;
+    }
+
     /// Returns a clone of the metrics for a specific tool, or `None` if the
     /// tool has never been called.
     pub fn tool_metrics(&self, tool_name: &str) -> Option<ToolMetrics> {
@@ -227,6 +243,16 @@ impl MetricsCollector {
     /// Returns the number of ignored disorder advisories.
     pub fn harness_disorder_advisory_ignored_total(&self) -> u64 {
         *self.harness_disorder_advisory_ignored_total.lock().unwrap()
+    }
+
+    /// Returns the number of max-iteration crash guard hits.
+    pub fn harness_max_iter_reached_total(&self) -> u64 {
+        *self.harness_max_iter_reached_total.lock().unwrap()
+    }
+
+    /// Returns the number of legacy final synthesis fallback invocations.
+    pub fn synthesis_legacy_invoked_total(&self) -> u64 {
+        *self.synthesis_legacy_invoked_total.lock().unwrap()
     }
 
     /// Cumulative cache-hit ratio: `total_tokens_cached / total_tokens_in`
@@ -374,6 +400,8 @@ mod tests {
         assert!(collector.all_tool_metrics().is_empty());
         assert_eq!(collector.total_tool_calls(), 0);
         assert_eq!(collector.total_tokens(), (0, 0));
+        assert_eq!(collector.harness_max_iter_reached_total(), 0);
+        assert_eq!(collector.synthesis_legacy_invoked_total(), 0);
     }
 
     #[test]
@@ -434,6 +462,18 @@ mod tests {
         assert_eq!(collector.total_cached_tokens(), 0);
         assert_eq!(collector.total_cache_creation_tokens(), 0);
         assert_eq!(collector.cache_hit_ratio(), 0.0);
+    }
+
+    #[test]
+    fn test_record_harness_crash_guard_metrics() {
+        let collector = MetricsCollector::new();
+
+        collector.record_harness_max_iter_reached();
+        collector.record_harness_max_iter_reached();
+        collector.record_synthesis_legacy_invoked();
+
+        assert_eq!(collector.harness_max_iter_reached_total(), 2);
+        assert_eq!(collector.synthesis_legacy_invoked_total(), 1);
     }
 
     #[test]
