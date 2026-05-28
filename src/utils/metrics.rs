@@ -58,6 +58,8 @@ pub struct MetricsCollector {
     total_tokens_cached: Mutex<u64>,
     /// Cumulative `cache_creation_input_tokens` (Anthropic only).
     total_tokens_cache_creation: Mutex<u64>,
+    /// Number of turns that accepted valid free text after entering the tool loop.
+    harness_implicit_termination_total: Mutex<u64>,
 }
 
 impl MetricsCollector {
@@ -70,6 +72,7 @@ impl MetricsCollector {
             total_tokens_out: Mutex::new(0),
             total_tokens_cached: Mutex::new(0),
             total_tokens_cache_creation: Mutex::new(0),
+            harness_implicit_termination_total: Mutex::new(0),
         }
     }
 
@@ -126,6 +129,11 @@ impl MetricsCollector {
         *self.total_tokens_cache_creation.lock().unwrap() += cache_creation_tokens;
     }
 
+    /// Records an implicit final answer accepted after at least one real tool call.
+    pub fn record_harness_implicit_termination(&self) {
+        *self.harness_implicit_termination_total.lock().unwrap() += 1;
+    }
+
     /// Returns a clone of the metrics for a specific tool, or `None` if the
     /// tool has never been called.
     pub fn tool_metrics(&self, tool_name: &str) -> Option<ToolMetrics> {
@@ -161,6 +169,11 @@ impl MetricsCollector {
     /// `input` from [`total_tokens`], Anthropic-only).
     pub fn total_cache_creation_tokens(&self) -> u64 {
         *self.total_tokens_cache_creation.lock().unwrap()
+    }
+
+    /// Returns the number of implicit tool-loop terminations accepted.
+    pub fn harness_implicit_termination_total(&self) -> u64 {
+        *self.harness_implicit_termination_total.lock().unwrap()
     }
 
     /// Cumulative cache-hit ratio: `total_tokens_cached / total_tokens_in`

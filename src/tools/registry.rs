@@ -19,6 +19,7 @@ use super::{Tool, ToolContext, ToolOutput};
 const GET_TOOL_SCHEMA_NAME: &str = "get_tool_schema";
 const GET_TOOL_SCHEMA_EXPOSED_NAME: &str = "internal__get_tool_schema";
 const MAX_EXPOSED_TOOL_NAME_LEN: usize = 64;
+const META_TOOLS: &[&str] = &["final_answer"];
 
 /// The kind of tool behind an exposed lazy-schema name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,7 +298,11 @@ impl ToolRegistry {
                     .map(|tool| ToolDefinition {
                         name: handle.exposed_name,
                         description: tool.compact_description().to_string(),
-                        parameters: placeholder_parameters(),
+                        parameters: if is_meta_tool(tool.name()) {
+                            tool.parameters()
+                        } else {
+                            placeholder_parameters()
+                        },
                     })
             })
             .collect();
@@ -528,7 +533,11 @@ impl ToolRegistry {
         let mut handles = Vec::with_capacity(tools.len());
 
         for (tool_name, tool) in tools {
-            let candidate = sanitize_exposed_name(&tool.lazy_exposed_name_candidate());
+            let candidate = if is_meta_tool(tool_name) {
+                tool_name.to_string()
+            } else {
+                sanitize_exposed_name(&tool.lazy_exposed_name_candidate())
+            };
             let kind = if candidate.starts_with("mcp__") {
                 ToolHandleKind::Mcp
             } else {
@@ -557,6 +566,10 @@ fn placeholder_parameters() -> Value {
         "type": "object",
         "additionalProperties": true,
     })
+}
+
+fn is_meta_tool(name: &str) -> bool {
+    META_TOOLS.contains(&name)
 }
 
 fn get_tool_schema_parameters() -> Value {
@@ -764,7 +777,7 @@ fn value_matches_type(value: &Value, kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::EchoTool;
+    use crate::tools::{EchoTool, FinalAnswerTool};
     use async_trait::async_trait;
     use serde_json::{json, Value};
 
@@ -993,6 +1006,31 @@ mod tests {
         assert!(defs
             .iter()
             .any(|def| def.name == "internal__get_tool_schema"));
+    }
+
+    #[test]
+    fn test_definitions_lazy_keeps_meta_tool_schema_exposed() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        registry.register(Box::new(FinalAnswerTool));
+
+        let defs = registry.definitions_lazy();
+        let final_answer = defs
+            .iter()
+            .find(|def| def.name == "final_answer")
+            .expect("final_answer must keep its real exposed name");
+
+        assert_eq!(
+            final_answer.parameters["required"],
+            json!(["content", "status"])
+        );
+        assert_eq!(
+            registry
+                .resolve_exposed("final_answer")
+                .expect("final_answer should resolve")
+                .tool_name,
+            "final_answer"
+        );
     }
 
     #[test]

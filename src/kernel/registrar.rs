@@ -222,6 +222,8 @@ pub async fn register_all_tools(
     // Track external (plugin/MCP/custom/composed) tool names for taint engine
     let mut external_tool_names: HashSet<String> = HashSet::new();
 
+    registry.register(Box::new(crate::tools::FinalAnswerTool));
+
     // --- Group 1: Simple tools (no dependencies beyond config) ---
     if filter.is_enabled("echo") {
         registry.register(Box::new(crate::tools::EchoTool));

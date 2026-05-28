@@ -70,6 +70,7 @@ pub mod delegate;
 pub mod diff;
 pub mod docx_read;
 pub mod filesystem;
+pub mod final_answer;
 pub mod find;
 pub mod git;
 #[cfg(feature = "google")]
@@ -115,6 +116,7 @@ pub use composed::{ComposedTool, CreateToolTool};
 pub use custom::CustomTool;
 pub use delegate::DelegateTool;
 pub use docx_read::DocxReadTool;
+pub use final_answer::FinalAnswerTool;
 pub use find::FindTool;
 pub use git::GitTool;
 #[cfg(feature = "google")]
