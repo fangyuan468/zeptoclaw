@@ -19,7 +19,7 @@ use super::{Tool, ToolContext, ToolOutput};
 const GET_TOOL_SCHEMA_NAME: &str = "get_tool_schema";
 const GET_TOOL_SCHEMA_EXPOSED_NAME: &str = "internal__get_tool_schema";
 const MAX_EXPOSED_TOOL_NAME_LEN: usize = 64;
-const META_TOOLS: &[&str] = &["final_answer"];
+const META_TOOLS: &[&str] = &["final_answer", "propose_plan", "revise_plan"];
 
 /// The kind of tool behind an exposed lazy-schema name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -777,7 +777,7 @@ fn value_matches_type(value: &Value, kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{EchoTool, FinalAnswerTool};
+    use crate::tools::{EchoTool, FinalAnswerTool, ProposePlanTool, RevisePlanTool};
     use async_trait::async_trait;
     use serde_json::{json, Value};
 
@@ -1013,6 +1013,8 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool));
         registry.register(Box::new(FinalAnswerTool));
+        registry.register(Box::new(ProposePlanTool));
+        registry.register(Box::new(RevisePlanTool));
 
         let defs = registry.definitions_lazy();
         let final_answer = defs
@@ -1030,6 +1032,33 @@ mod tests {
                 .expect("final_answer should resolve")
                 .tool_name,
             "final_answer"
+        );
+        let propose_plan = defs
+            .iter()
+            .find(|def| def.name == "propose_plan")
+            .expect("propose_plan must keep its real exposed name");
+        assert_eq!(propose_plan.parameters["required"], json!(["subtasks"]));
+        assert_eq!(
+            registry
+                .resolve_exposed("propose_plan")
+                .expect("propose_plan should resolve")
+                .tool_name,
+            "propose_plan"
+        );
+        let revise_plan = defs
+            .iter()
+            .find(|def| def.name == "revise_plan")
+            .expect("revise_plan must keep its real exposed name");
+        assert_eq!(
+            revise_plan.parameters["required"],
+            json!(["decision", "reason"])
+        );
+        assert_eq!(
+            registry
+                .resolve_exposed("revise_plan")
+                .expect("revise_plan should resolve")
+                .tool_name,
+            "revise_plan"
         );
     }
 

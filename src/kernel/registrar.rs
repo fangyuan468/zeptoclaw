@@ -223,6 +223,8 @@ pub async fn register_all_tools(
     let mut external_tool_names: HashSet<String> = HashSet::new();
 
     registry.register(Box::new(crate::tools::FinalAnswerTool));
+    registry.register(Box::new(crate::tools::ProposePlanTool));
+    registry.register(Box::new(crate::tools::RevisePlanTool));
 
     // --- Group 1: Simple tools (no dependencies beyond config) ---
     if filter.is_enabled("echo") {

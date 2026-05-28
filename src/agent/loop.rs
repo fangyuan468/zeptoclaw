@@ -1509,6 +1509,27 @@ mod tests {
 
     struct ConcurrentFinalAnswerProvider;
 
+    struct PlanThenFinalAnswerProvider {
+        calls: std::sync::Mutex<u8>,
+        observed_messages: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl PlanThenFinalAnswerProvider {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+                observed_messages: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn observed_messages(&self) -> Vec<Vec<Message>> {
+            self.observed_messages
+                .lock()
+                .expect("observed messages lock poisoned")
+                .clone()
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct RecordedProviderCall {
         is_summary: bool,
@@ -1789,6 +1810,51 @@ mod tests {
                     LLMToolCall::new("call_read", "read_file", "{}"),
                 ],
             ))
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for PlanThenFinalAnswerProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+
+        async fn chat(
+            &self,
+            messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _model: Option<&str>,
+            _options: ChatOptions,
+        ) -> Result<LLMResponse> {
+            self.observed_messages
+                .lock()
+                .expect("observed messages lock poisoned")
+                .push(messages);
+            let mut calls = self.calls.lock().expect("provider call counter poisoned");
+            *calls += 1;
+            if *calls == 1 {
+                Ok(LLMResponse::with_tools(
+                    "",
+                    vec![LLMToolCall::new(
+                        "call_plan",
+                        "propose_plan",
+                        r#"{"subtasks":[{"description":"Search sources","acceptance":"At least two sources found","tool_budget":2},{"description":"Compare products","acceptance":"Comparison table ready"}],"rationale":"The user asked for a multi-product research comparison."}"#,
+                    )],
+                ))
+            } else {
+                Ok(LLMResponse::with_tools(
+                    "",
+                    vec![LLMToolCall::new(
+                        "call_final",
+                        "final_answer",
+                        r#"{"content":"planned final answer","status":"complete"}"#,
+                    )],
+                ))
+            }
         }
     }
 
@@ -2997,6 +3063,83 @@ tail line
         assert_eq!(
             metadata.get("final_answer_status").and_then(|v| v.as_str()),
             Some("partial")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_intercepts_propose_plan_and_injects_plan_prompt() {
+        let config = Config::default();
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let provider = Arc::new(PlanThenFinalAnswerProvider::new());
+
+        agent.set_provider_arc(provider.clone()).await;
+        agent
+            .register_tool(Box::new(crate::tools::FinalAnswerTool))
+            .await;
+        agent
+            .register_tool(Box::new(crate::tools::ProposePlanTool))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "propose-plan", "research several tools");
+        let content = agent
+            .process_message(&msg)
+            .await
+            .expect("plan meta-tool should be intercepted");
+
+        assert_eq!(content, "planned final answer");
+        assert_eq!(agent.metrics_collector().harness_plan_proposed_total(), 1);
+        let observed = provider.observed_messages();
+        assert_eq!(observed.len(), 2);
+        assert!(
+            observed[1]
+                .iter()
+                .any(|message| message.role == Role::System
+                    && message.content.contains("Current plan:")
+                    && message.content.contains("Search sources")),
+            "second provider call should include the plan prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_streaming_intercepts_propose_plan() {
+        let config = Config::default();
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let provider = Arc::new(PlanThenFinalAnswerProvider::new());
+
+        agent.set_provider_arc(provider.clone()).await;
+        agent
+            .register_tool(Box::new(crate::tools::FinalAnswerTool))
+            .await;
+        agent
+            .register_tool(Box::new(crate::tools::ProposePlanTool))
+            .await;
+
+        let msg = InboundMessage::new(
+            "cli",
+            "user",
+            "propose-plan-stream",
+            "research several tools",
+        );
+        let stream = agent
+            .process_message_streaming(&msg)
+            .await
+            .expect("streaming plan meta-tool should be intercepted");
+        let (content, _) = collect_stream_done(stream).await;
+
+        assert_eq!(content, "planned final answer");
+        assert_eq!(agent.metrics_collector().harness_plan_proposed_total(), 1);
+        let observed = provider.observed_messages();
+        assert_eq!(observed.len(), 2);
+        assert!(
+            observed[1]
+                .iter()
+                .any(|message| message.role == Role::System
+                    && message.content.contains("Current plan:")),
+            "second provider call should include the plan prompt"
         );
     }
 

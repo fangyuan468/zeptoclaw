@@ -88,9 +88,11 @@ pub mod output;
 pub mod pdf_read;
 pub mod plugin;
 pub mod project;
+pub mod propose_plan;
 pub mod r8r;
 mod registry;
 pub mod reminder;
+pub mod revise_plan;
 #[cfg(feature = "screenshot")]
 pub mod screenshot;
 pub mod shell;
@@ -130,9 +132,11 @@ pub use memory::{MemoryGetTool, MemorySearchTool};
 pub use message::MessageTool;
 pub use pdf_read::PdfReadTool;
 pub use project::ProjectTool;
+pub use propose_plan::ProposePlanTool;
 pub use r8r::R8rTool;
 pub use registry::ToolRegistry;
 pub use reminder::ReminderTool;
+pub use revise_plan::RevisePlanTool;
 #[cfg(feature = "screenshot")]
 pub use screenshot::WebScreenshotTool;
 pub use skills_install::InstallSkillTool;
