@@ -65,6 +65,7 @@ pub mod facade;
 mod file_artifact;
 mod format;
 mod harness;
+mod harness_state;
 mod r#loop;
 mod loop_events;
 pub mod loop_guard;

@@ -33,6 +33,7 @@ use super::format::{
     assistant_message_with_tool_calls, build_thinking_detail, build_tool_result_payload,
     prettify_tool_arguments,
 };
+use super::harness_state::{HarnessTurnState, PROPOSE_PLAN_TOOL_NAME, REVISE_PLAN_TOOL_NAME};
 use super::inbound::inbound_to_message;
 use super::loop_events::{
     publish_tool_call_finished_event, publish_tool_call_started_event, ThinkingScope,
@@ -61,6 +62,7 @@ pub(super) struct Harness<'a> {
 const PHASE0_FALLBACK_CONTENT: &str = "Sorry, I could not produce a displayable final answer for this turn. Please retry, or make the task more specific so I can continue from the tool results already gathered.";
 const FINAL_ANSWER_TOOL_NAME: &str = "final_answer";
 const FINAL_ANSWER_REPROMPT: &str = "Your previous final_answer was empty or contained provider tool markup. Call final_answer again with plain user-visible text in content and an accurate status.";
+const TOOL_LOOP_CONTRACT_PROMPT: &str = "You may answer directly in plain text if no tools are needed. Once you call any tool other than final_answer, propose_plan, or revise_plan, terminate the turn by calling final_answer with the final user-visible answer in content. If the task needs multiple dynamic steps, you may call propose_plan. While a plan is active, call revise_plan when you finish a subtask or need to change direction.";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -318,6 +320,70 @@ impl<'a> Harness<'a> {
         Ok(text)
     }
 
+    fn append_turn_state_messages(
+        &self,
+        messages: &mut Vec<Message>,
+        turn_state: &mut HarnessTurnState,
+        metrics_collector: &crate::utils::metrics::MetricsCollector,
+    ) {
+        messages.push(Message::system(TOOL_LOOP_CONTRACT_PROMPT));
+        if let Some(plan_prompt) = turn_state.render_plan_prompt() {
+            messages.push(Message::system(&plan_prompt));
+        }
+        if let Some((signal, advisory)) = turn_state.take_disorder_advisory() {
+            metrics_collector.record_harness_disorder_advisory(signal.as_label());
+            messages.push(Message::system(advisory));
+        }
+    }
+
+    async fn intercept_plan_meta_tools(
+        &self,
+        response: &mut LLMResponse,
+        turn_state: &mut HarnessTurnState,
+        iteration: u32,
+        metrics_collector: &crate::utils::metrics::MetricsCollector,
+    ) -> (Vec<LLMToolCall>, Vec<ToolObservation>) {
+        let lazy_tool_schema = self.agent.config.agents.defaults.lazy_tool_schema;
+        let tools = self.agent.tools.read().await;
+        let mut real_tool_calls = Vec::new();
+        let mut meta_tool_calls = Vec::new();
+        let mut observations = Vec::new();
+        let mut used_plan_tool = false;
+
+        for tool_call in std::mem::take(&mut response.tool_calls) {
+            let name = resolve_tool_call_name(&tools, &tool_call.name, lazy_tool_schema).0;
+            match name.as_str() {
+                PROPOSE_PLAN_TOOL_NAME => {
+                    used_plan_tool = true;
+                    metrics_collector.record_harness_plan_proposed();
+                    meta_tool_calls.push(tool_call.clone());
+                    observations.push(turn_state.handle_propose_plan(
+                        tool_call.id,
+                        &tool_call.arguments,
+                        iteration,
+                    ));
+                }
+                REVISE_PLAN_TOOL_NAME => {
+                    used_plan_tool = true;
+                    metrics_collector.record_harness_plan_revised();
+                    meta_tool_calls.push(tool_call.clone());
+                    observations.push(turn_state.handle_revise_plan(
+                        tool_call.id,
+                        &tool_call.arguments,
+                        iteration,
+                    ));
+                }
+                _ => real_tool_calls.push(tool_call),
+            }
+        }
+
+        if turn_state.note_llm_response_after_advisory(used_plan_tool) {
+            metrics_collector.record_harness_disorder_advisory_ignored();
+        }
+        response.tool_calls = real_tool_calls;
+        (meta_tool_calls, observations)
+    }
+
     async fn refresh_anchored_summary_if_due(
         &self,
         session: &mut Session,
@@ -521,10 +587,12 @@ impl<'a> Harness<'a> {
             .agent
             .build_memory_override(&resolved_user_prompt)
             .await;
+        let mut turn_state = HarnessTurnState::default();
         let mut messages = self
             .agent
             .build_resolved_messages(msg, &session, memory_override.as_deref())
             .await;
+        self.append_turn_state_messages(&mut messages, &mut turn_state, &metrics_collector);
 
         // Get tool definitions (short-lived read lock)
         let tool_definitions = {
@@ -561,6 +629,11 @@ impl<'a> Harness<'a> {
                         .agent
                         .build_resolved_messages(msg, &session, memory_override.as_deref())
                         .await;
+                    self.append_turn_state_messages(
+                        &mut messages,
+                        &mut turn_state,
+                        &metrics_collector,
+                    );
                 }
             }
         }
@@ -713,6 +786,7 @@ impl<'a> Harness<'a> {
                 .token_budget
                 .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
         }
+        turn_state.record_model_content(&response.content);
 
         // Cache the response if it has no tool calls (pure text reply).
         // Responses with tool calls depend on tool execution and are not cacheable.
@@ -779,6 +853,14 @@ impl<'a> Harness<'a> {
                     }
                 }
             }
+            let (meta_tool_calls, meta_observations) = self
+                .intercept_plan_meta_tools(
+                    &mut response,
+                    &mut turn_state,
+                    iteration,
+                    &metrics_collector,
+                )
+                .await;
             iteration += 1;
             debug!("Tool iteration {} of {}", iteration, max_iterations);
 
@@ -817,7 +899,9 @@ impl<'a> Harness<'a> {
             // Some OpenAI-compatible providers also echo provider-specific
             // tool-call markup in `content`; the structured tool_calls are
             // the source of truth, so keep that markup out of future prompts.
-            session.add_message(assistant_message_with_tool_calls(&response.tool_calls));
+            let mut assistant_tool_calls = meta_tool_calls;
+            assistant_tool_calls.extend(response.tool_calls.clone());
+            session.add_message(assistant_message_with_tool_calls(&assistant_tool_calls));
 
             // Execute tool calls in parallel
             let workspace = self.agent.config.workspace_path();
@@ -1273,9 +1357,14 @@ impl<'a> Harness<'a> {
                 .map(|tc| tc.name.clone())
                 .collect();
             chain_tracker.record(&tool_names);
+            turn_state.record_tool_calls(&tool_names);
 
             let results: Vec<ToolObservation> = results;
+            turn_state.record_observations(&results);
             let should_pause = results.iter().any(|obs| obs.pause_for_input);
+            for obs in &meta_observations {
+                session.add_message(Message::tool_result(&obs.call_id, &obs.content));
+            }
             for obs in &results {
                 session.add_message(Message::tool_result(&obs.call_id, &obs.content));
             }
@@ -1421,10 +1510,15 @@ impl<'a> Harness<'a> {
             }
 
             if let Some(guard) = loop_guard.as_mut() {
+                let before_guard_messages = session.messages.len();
                 if check_loop_guard(guard, &response.tool_calls, &mut session) {
+                    turn_state.record_loop_guard_signal();
                     response.content =
                         "Stopped tool loop due to repeated tool-call pattern.".to_string();
                     break;
+                }
+                if session.messages.len() > before_guard_messages {
+                    turn_state.record_loop_guard_signal();
                 }
 
                 // Record outcomes for outcome-aware blocking.
@@ -1438,9 +1532,13 @@ impl<'a> Harness<'a> {
                     &results_for_guard,
                     &mut session,
                 ) {
+                    turn_state.record_loop_guard_signal();
                     response.content =
                         "Stopped tool loop due to repeated identical outcomes.".to_string();
                     break;
+                }
+                if session.messages.len() > before_guard_messages {
+                    turn_state.record_loop_guard_signal();
                 }
             }
 
@@ -1464,6 +1562,8 @@ impl<'a> Harness<'a> {
                 .agent
                 .build_resolved_messages(msg, &session, memory_override.as_deref())
                 .await;
+            turn_state.check_plan_stagnation(iteration);
+            self.append_turn_state_messages(&mut messages, &mut turn_state, &metrics_collector);
 
             // Pre-flight context guard (tool loop)
             if let Some(ref monitor) = self.agent.context_monitor {
@@ -1491,6 +1591,11 @@ impl<'a> Harness<'a> {
                             .agent
                             .build_resolved_messages(msg, &session, memory_override.as_deref())
                             .await;
+                        self.append_turn_state_messages(
+                            &mut messages,
+                            &mut turn_state,
+                            &metrics_collector,
+                        );
                     }
                 }
             }
@@ -1547,6 +1652,11 @@ impl<'a> Harness<'a> {
                         .agent
                         .build_resolved_messages(msg, &session, memory_override.as_deref())
                         .await;
+                    self.append_turn_state_messages(
+                        &mut last_messages,
+                        &mut turn_state,
+                        &metrics_collector,
+                    );
                     last_tool_defs = {
                         let tools = self.agent.tools.read().await;
                         tools.definitions_for_mode(
@@ -1598,6 +1708,7 @@ impl<'a> Harness<'a> {
                     .token_budget
                     .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
             }
+            turn_state.record_model_content(&response.content);
         }
 
         let max_iter_reached = iteration >= max_iterations && response.has_tool_calls();
@@ -1909,10 +2020,12 @@ impl<'a> Harness<'a> {
             .agent
             .build_memory_override(&resolved_user_prompt)
             .await;
+        let mut turn_state = HarnessTurnState::default();
         let mut messages = self
             .agent
             .build_resolved_messages(msg, &session, memory_override.as_deref())
             .await;
+        self.append_turn_state_messages(&mut messages, &mut turn_state, &metrics_collector);
 
         let tool_definitions = {
             let tools = self.agent.tools.read().await;
@@ -1948,6 +2061,11 @@ impl<'a> Harness<'a> {
                         .agent
                         .build_resolved_messages(msg, &session, memory_override.as_deref())
                         .await;
+                    self.append_turn_state_messages(
+                        &mut messages,
+                        &mut turn_state,
+                        &metrics_collector,
+                    );
                 }
             }
         }
@@ -2016,6 +2134,11 @@ impl<'a> Harness<'a> {
                     .agent
                     .build_resolved_messages(msg, &session, memory_override.as_deref())
                     .await;
+                self.append_turn_state_messages(
+                    &mut last_messages,
+                    &mut turn_state,
+                    &metrics_collector,
+                );
                 last_tool_defs = {
                     let tools = self.agent.tools.read().await;
                     tools.definitions_for_mode(
@@ -2063,6 +2186,7 @@ impl<'a> Harness<'a> {
                 .token_budget
                 .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
         }
+        turn_state.record_model_content(&response.content);
 
         // User message was already added to session before build_messages above.
 
@@ -2127,6 +2251,14 @@ impl<'a> Harness<'a> {
                     }
                 }
             }
+            let (meta_tool_calls, meta_observations) = self
+                .intercept_plan_meta_tools(
+                    &mut response,
+                    &mut turn_state,
+                    iteration,
+                    &metrics_collector,
+                )
+                .await;
             iteration += 1;
             debug!("Tool iteration {} of {}", iteration, max_iterations);
 
@@ -2162,7 +2294,9 @@ impl<'a> Harness<'a> {
             // Some OpenAI-compatible providers also echo provider-specific
             // tool-call markup in `content`; the structured tool_calls are
             // the source of truth, so keep that markup out of future prompts.
-            session.add_message(assistant_message_with_tool_calls(&response.tool_calls));
+            let mut assistant_tool_calls = meta_tool_calls;
+            assistant_tool_calls.extend(response.tool_calls.clone());
+            session.add_message(assistant_message_with_tool_calls(&assistant_tool_calls));
 
             let workspace = self.agent.config.workspace_path();
             let workspace_str = workspace.to_string_lossy();
@@ -2597,8 +2731,13 @@ impl<'a> Harness<'a> {
                 .map(|tc| tc.name.clone())
                 .collect();
             chain_tracker.record(&tool_names);
+            turn_state.record_tool_calls(&tool_names);
             let results: Vec<ToolObservation> = results;
+            turn_state.record_observations(&results);
             let should_pause = results.iter().any(|obs| obs.pause_for_input);
+            for obs in &meta_observations {
+                session.add_message(Message::tool_result(&obs.call_id, &obs.content));
+            }
             for obs in &results {
                 session.add_message(Message::tool_result(&obs.call_id, &obs.content));
             }
@@ -2652,10 +2791,15 @@ impl<'a> Harness<'a> {
             }
 
             if let Some(guard) = loop_guard.as_mut() {
+                let before_guard_messages = session.messages.len();
                 if check_loop_guard(guard, &response.tool_calls, &mut session) {
+                    turn_state.record_loop_guard_signal();
                     response.content =
                         "Stopped tool loop due to repeated tool-call pattern.".to_string();
                     break;
+                }
+                if session.messages.len() > before_guard_messages {
+                    turn_state.record_loop_guard_signal();
                 }
 
                 // Record outcomes for outcome-aware blocking.
@@ -2669,9 +2813,13 @@ impl<'a> Harness<'a> {
                     &results_for_guard,
                     &mut session,
                 ) {
+                    turn_state.record_loop_guard_signal();
                     response.content =
                         "Stopped tool loop due to repeated identical outcomes.".to_string();
                     break;
+                }
+                if session.messages.len() > before_guard_messages {
+                    turn_state.record_loop_guard_signal();
                 }
             }
 
@@ -2693,6 +2841,8 @@ impl<'a> Harness<'a> {
                 .agent
                 .build_resolved_messages(msg, &session, memory_override.as_deref())
                 .await;
+            turn_state.check_plan_stagnation(iteration);
+            self.append_turn_state_messages(&mut messages, &mut turn_state, &metrics_collector);
 
             // Pre-flight context guard (streaming tool loop)
             if let Some(ref monitor) = self.agent.context_monitor {
@@ -2720,6 +2870,11 @@ impl<'a> Harness<'a> {
                             .agent
                             .build_resolved_messages(msg, &session, memory_override.as_deref())
                             .await;
+                        self.append_turn_state_messages(
+                            &mut messages,
+                            &mut turn_state,
+                            &metrics_collector,
+                        );
                     }
                 }
             }
@@ -2775,6 +2930,11 @@ impl<'a> Harness<'a> {
                         .agent
                         .build_resolved_messages(msg, &session, memory_override.as_deref())
                         .await;
+                    self.append_turn_state_messages(
+                        &mut last_messages,
+                        &mut turn_state,
+                        &metrics_collector,
+                    );
                     last_tool_defs = {
                         let tools = self.agent.tools.read().await;
                         tools.definitions_for_mode(
@@ -2823,6 +2983,7 @@ impl<'a> Harness<'a> {
                     .token_budget
                     .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
             }
+            turn_state.record_model_content(&response.content);
         }
 
         if let Some(tx) = self.agent.tool_feedback_tx.read().await.as_ref() {
@@ -2838,15 +2999,19 @@ impl<'a> Harness<'a> {
             // Re-issue the final call via chat_stream.
             // If the tool call limit was hit, pass empty tools so the model
             // cannot emit further tool calls after the cap was enforced.
-            let messages = self
+            let mut messages = self
                 .agent
                 .build_resolved_messages(msg, &session, memory_override.as_deref())
                 .await;
+            if let Some(plan_prompt) = turn_state.render_plan_prompt() {
+                messages.push(Message::system(&plan_prompt));
+            }
 
-            // Final streaming call: tools are intentionally omitted. By
-            // contract the tool loop above has already exhausted every
-            // tool decision the model wanted to make, so this call is
-            // supposed to emit the user-visible answer only. Leaving
+            // Final streaming call: tools are intentionally omitted. Only
+            // the read-only plan snapshot is still useful here: the tool-loop
+            // contract no longer applies, and any disorder advisory was
+            // already offered to in-loop calls. The model is supposed to emit
+            // the user-visible answer only. Leaving
             // tools in the catalog tempts providers (OpenAI, DeepSeek,
             // Claude) to emit StreamEvent::ToolCalls mid-stream — a
             // legitimate model behaviour we then mis-handled as a hard

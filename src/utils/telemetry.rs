@@ -67,6 +67,10 @@ pub fn render(collector: &MetricsCollector, format: &TelemetryFormat) -> String 
 /// - `zeptoclaw_tokens_input_total` (counter)
 /// - `zeptoclaw_tokens_output_total` (counter)
 /// - `zeptoclaw_harness_implicit_termination_total` (counter)
+/// - `zeptoclaw_harness_plan_proposed_total` (counter)
+/// - `zeptoclaw_harness_plan_revised_total` (counter)
+/// - `zeptoclaw_harness_disorder_advisory_total` (counter)
+/// - `zeptoclaw_harness_disorder_advisory_ignored_total` (counter)
 /// - `zeptoclaw_session_duration_seconds` (gauge)
 pub fn render_prometheus(collector: &MetricsCollector) -> String {
     let mut out = String::new();
@@ -151,6 +155,44 @@ pub fn render_prometheus(collector: &MetricsCollector) -> String {
         collector.harness_implicit_termination_total()
     ));
 
+    out.push_str(
+        "# HELP zeptoclaw_harness_plan_proposed_total Total plans proposed by the model.\n",
+    );
+    out.push_str("# TYPE zeptoclaw_harness_plan_proposed_total counter\n");
+    out.push_str(&format!(
+        "zeptoclaw_harness_plan_proposed_total {}\n",
+        collector.harness_plan_proposed_total()
+    ));
+
+    out.push_str(
+        "# HELP zeptoclaw_harness_plan_revised_total Total plan revisions by the model.\n",
+    );
+    out.push_str("# TYPE zeptoclaw_harness_plan_revised_total counter\n");
+    out.push_str(&format!(
+        "zeptoclaw_harness_plan_revised_total {}\n",
+        collector.harness_plan_revised_total()
+    ));
+
+    out.push_str("# HELP zeptoclaw_harness_disorder_advisory_total Total disorder advisories injected by signal.\n");
+    out.push_str("# TYPE zeptoclaw_harness_disorder_advisory_total counter\n");
+    let advisories: BTreeMap<_, _> = collector
+        .harness_disorder_advisory_totals()
+        .into_iter()
+        .collect();
+    for (signal, count) in advisories {
+        out.push_str(&format!(
+            "zeptoclaw_harness_disorder_advisory_total{{signal=\"{}\"}} {}\n",
+            signal, count
+        ));
+    }
+
+    out.push_str("# HELP zeptoclaw_harness_disorder_advisory_ignored_total Total disorder advisories followed by responses that did not use plan tools.\n");
+    out.push_str("# TYPE zeptoclaw_harness_disorder_advisory_ignored_total counter\n");
+    out.push_str(&format!(
+        "zeptoclaw_harness_disorder_advisory_ignored_total {}\n",
+        collector.harness_disorder_advisory_ignored_total()
+    ));
+
     // --- session duration ---
     out.push_str("# HELP zeptoclaw_session_duration_seconds Session uptime in seconds.\n");
     out.push_str("# TYPE zeptoclaw_session_duration_seconds gauge\n");
@@ -206,6 +248,10 @@ pub fn render_json(collector: &MetricsCollector) -> String {
         "tokens_input_total": tokens_in,
         "tokens_output_total": tokens_out,
         "zeptoclaw_harness_implicit_termination_total": collector.harness_implicit_termination_total(),
+        "zeptoclaw_harness_plan_proposed_total": collector.harness_plan_proposed_total(),
+        "zeptoclaw_harness_plan_revised_total": collector.harness_plan_revised_total(),
+        "zeptoclaw_harness_disorder_advisory_total": collector.harness_disorder_advisory_totals(),
+        "zeptoclaw_harness_disorder_advisory_ignored_total": collector.harness_disorder_advisory_ignored_total(),
         "session_duration_seconds": collector.session_duration().as_secs_f64(),
     });
 
@@ -344,6 +390,10 @@ mod tests {
             "zeptoclaw_tokens_input_total",
             "zeptoclaw_tokens_output_total",
             "zeptoclaw_harness_implicit_termination_total",
+            "zeptoclaw_harness_plan_proposed_total",
+            "zeptoclaw_harness_plan_revised_total",
+            "zeptoclaw_harness_disorder_advisory_total",
+            "zeptoclaw_harness_disorder_advisory_ignored_total",
             "zeptoclaw_session_duration_seconds",
         ];
 
@@ -376,6 +426,16 @@ mod tests {
         assert_eq!(parsed["tokens_input_total"], 0);
         assert_eq!(parsed["tokens_output_total"], 0);
         assert_eq!(parsed["zeptoclaw_harness_implicit_termination_total"], 0);
+        assert_eq!(parsed["zeptoclaw_harness_plan_proposed_total"], 0);
+        assert_eq!(parsed["zeptoclaw_harness_plan_revised_total"], 0);
+        assert_eq!(
+            parsed["zeptoclaw_harness_disorder_advisory_total"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            parsed["zeptoclaw_harness_disorder_advisory_ignored_total"],
+            0
+        );
         assert!(parsed["session_duration_seconds"].as_f64().unwrap() >= 0.0);
     }
 
@@ -401,6 +461,7 @@ mod tests {
         assert_eq!(parsed["tokens_input_total"], 500);
         assert_eq!(parsed["tokens_output_total"], 200);
         assert_eq!(parsed["zeptoclaw_harness_implicit_termination_total"], 0);
+        assert_eq!(parsed["zeptoclaw_harness_plan_proposed_total"], 0);
     }
 
     // -- render dispatches correctly --

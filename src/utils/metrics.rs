@@ -60,6 +60,14 @@ pub struct MetricsCollector {
     total_tokens_cache_creation: Mutex<u64>,
     /// Number of turns that accepted valid free text after entering the tool loop.
     harness_implicit_termination_total: Mutex<u64>,
+    /// Number of times the model proposed a turn plan.
+    harness_plan_proposed_total: Mutex<u64>,
+    /// Number of times the model revised an active turn plan.
+    harness_plan_revised_total: Mutex<u64>,
+    /// Number of disorder advisories injected, keyed by signal label.
+    harness_disorder_advisory_total: Mutex<HashMap<String, u64>>,
+    /// Number of injected disorder advisories followed by a response that did not use plan tools.
+    harness_disorder_advisory_ignored_total: Mutex<u64>,
 }
 
 impl MetricsCollector {
@@ -73,6 +81,10 @@ impl MetricsCollector {
             total_tokens_cached: Mutex::new(0),
             total_tokens_cache_creation: Mutex::new(0),
             harness_implicit_termination_total: Mutex::new(0),
+            harness_plan_proposed_total: Mutex::new(0),
+            harness_plan_revised_total: Mutex::new(0),
+            harness_disorder_advisory_total: Mutex::new(HashMap::new()),
+            harness_disorder_advisory_ignored_total: Mutex::new(0),
         }
     }
 
@@ -134,6 +146,27 @@ impl MetricsCollector {
         *self.harness_implicit_termination_total.lock().unwrap() += 1;
     }
 
+    /// Records that the model proposed a plan.
+    pub fn record_harness_plan_proposed(&self) {
+        *self.harness_plan_proposed_total.lock().unwrap() += 1;
+    }
+
+    /// Records that the model revised a plan.
+    pub fn record_harness_plan_revised(&self) {
+        *self.harness_plan_revised_total.lock().unwrap() += 1;
+    }
+
+    /// Records that a disorder advisory was injected for a signal.
+    pub fn record_harness_disorder_advisory(&self, signal: &str) {
+        let mut totals = self.harness_disorder_advisory_total.lock().unwrap();
+        *totals.entry(signal.to_string()).or_insert(0) += 1;
+    }
+
+    /// Records that the next model response ignored a disorder advisory.
+    pub fn record_harness_disorder_advisory_ignored(&self) {
+        *self.harness_disorder_advisory_ignored_total.lock().unwrap() += 1;
+    }
+
     /// Returns a clone of the metrics for a specific tool, or `None` if the
     /// tool has never been called.
     pub fn tool_metrics(&self, tool_name: &str) -> Option<ToolMetrics> {
@@ -174,6 +207,26 @@ impl MetricsCollector {
     /// Returns the number of implicit tool-loop terminations accepted.
     pub fn harness_implicit_termination_total(&self) -> u64 {
         *self.harness_implicit_termination_total.lock().unwrap()
+    }
+
+    /// Returns the number of plans proposed.
+    pub fn harness_plan_proposed_total(&self) -> u64 {
+        *self.harness_plan_proposed_total.lock().unwrap()
+    }
+
+    /// Returns the number of plan revisions.
+    pub fn harness_plan_revised_total(&self) -> u64 {
+        *self.harness_plan_revised_total.lock().unwrap()
+    }
+
+    /// Returns a snapshot of disorder advisory counts keyed by signal label.
+    pub fn harness_disorder_advisory_totals(&self) -> HashMap<String, u64> {
+        self.harness_disorder_advisory_total.lock().unwrap().clone()
+    }
+
+    /// Returns the number of ignored disorder advisories.
+    pub fn harness_disorder_advisory_ignored_total(&self) -> u64 {
+        *self.harness_disorder_advisory_ignored_total.lock().unwrap()
     }
 
     /// Cumulative cache-hit ratio: `total_tokens_cached / total_tokens_in`
