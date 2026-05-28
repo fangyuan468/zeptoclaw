@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use futures::FutureExt;
+use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
 use crate::agent::context_monitor::{CompactionUrgency, ContextMonitor, PreflightAction};
@@ -21,7 +22,7 @@ use crate::agent::loop_guard::LoopGuard;
 use crate::bus::InboundMessage;
 use crate::cache::ResponseCache;
 use crate::error::{Result, ZeptoError};
-use crate::providers::{ChatOptions, LLMProvider};
+use crate::providers::{ChatOptions, LLMProvider, LLMResponse, LLMToolCall};
 use crate::session::{Message, Role, Session};
 use crate::tools::ToolContext;
 
@@ -58,6 +59,64 @@ pub(super) struct Harness<'a> {
 }
 
 const PHASE0_FALLBACK_CONTENT: &str = "Sorry, I could not produce a displayable final answer for this turn. Please retry, or make the task more specific so I can continue from the tool results already gathered.";
+const FINAL_ANSWER_TOOL_NAME: &str = "final_answer";
+const FINAL_ANSWER_REPROMPT: &str = "Your previous final_answer was empty or contained provider tool markup. Call final_answer again with plain user-visible text in content and an accurate status.";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FinalAnswerStatus {
+    Complete,
+    Partial,
+    Blocked,
+}
+
+impl FinalAnswerStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FinalAnswerArgs {
+    content: String,
+    status: FinalAnswerStatus,
+}
+
+#[derive(Debug)]
+struct FinalAnswerCall {
+    content: String,
+    status: FinalAnswerStatus,
+}
+
+enum FinalAnswerDelivery {
+    Text(String, FinalAnswerStatus),
+    Fallback { reason: &'static str },
+}
+
+fn final_answer_message(content: &str, status: &FinalAnswerStatus) -> Message {
+    let mut message = Message::assistant(content);
+    message.metadata.insert(
+        "final_answer_status".to_string(),
+        serde_json::json!(status.as_str()),
+    );
+    message
+}
+
+fn parse_final_answer_tool_call(
+    tool_call: &LLMToolCall,
+) -> std::result::Result<FinalAnswerCall, String> {
+    let args: FinalAnswerArgs = tool_call
+        .parse_arguments()
+        .map_err(|error| format!("invalid final_answer arguments: {error}"))?;
+    Ok(FinalAnswerCall {
+        content: args.content,
+        status: args.status,
+    })
+}
 
 fn phase0_fallback_message(
     fallback_reason: &str,
@@ -101,6 +160,162 @@ fn phase0_fallback_reason(outcome: &TurnOutcome, synthesis_failed: bool) -> &'st
 impl<'a> Harness<'a> {
     pub(super) fn new(agent: &'a AgentLoop) -> Self {
         Self { agent }
+    }
+
+    async fn final_answer_call_from_response(
+        &self,
+        response: &LLMResponse,
+    ) -> Option<std::result::Result<FinalAnswerCall, String>> {
+        let lazy_tool_schema = self.agent.config.agents.defaults.lazy_tool_schema;
+        let tools = self.agent.tools.read().await;
+        for tool_call in &response.tool_calls {
+            let name = resolve_tool_call_name(&tools, &tool_call.name, lazy_tool_schema).0;
+            if name == FINAL_ANSWER_TOOL_NAME {
+                return Some(parse_final_answer_tool_call(tool_call));
+            }
+        }
+        None
+    }
+
+    async fn reprompt_for_final_answer(
+        &self,
+        msg: &InboundMessage,
+        session: &Session,
+        memory_override: Option<&str>,
+        provider: &Arc<dyn LLMProvider>,
+        model: Option<&str>,
+        options: &ChatOptions,
+    ) -> Result<Option<std::result::Result<FinalAnswerCall, String>>> {
+        let mut messages = self
+            .agent
+            .build_resolved_messages(msg, session, memory_override)
+            .await;
+        messages.push(Message::system(FINAL_ANSWER_REPROMPT));
+        let tool_definitions = {
+            let tools = self.agent.tools.read().await;
+            tools.definitions_for_tools(&[FINAL_ANSWER_TOOL_NAME])
+        };
+        if tool_definitions.is_empty() {
+            warn!("agent_turn: final_answer tool is not registered; cannot reprompt");
+            return Ok(None);
+        }
+
+        let response = provider
+            .chat(messages, tool_definitions, model, options.clone())
+            .await?;
+        Ok(self
+            .final_answer_call_from_response(&response)
+            .await
+            .or_else(|| {
+                Some(Err(
+                    "final_answer reprompt did not call final_answer".to_string()
+                ))
+            }))
+    }
+
+    fn validate_final_answer_call(
+        &self,
+        call: FinalAnswerCall,
+    ) -> std::result::Result<(String, FinalAnswerStatus), TurnOutcome> {
+        match classify_final_content(&call.content) {
+            TurnOutcome::FinalAnswer(text) => Ok((text, call.status)),
+            bad_outcome => Err(bad_outcome),
+        }
+    }
+
+    async fn handle_final_answer_or_reprompt(
+        &self,
+        parsed: std::result::Result<FinalAnswerCall, String>,
+        msg: &InboundMessage,
+        session: &Session,
+        memory_override: Option<&str>,
+        provider: &Arc<dyn LLMProvider>,
+        model: Option<&str>,
+        options: &ChatOptions,
+    ) -> Result<FinalAnswerDelivery> {
+        match parsed {
+            Ok(call) => match self.validate_final_answer_call(call) {
+                Ok((text, status)) => return Ok(FinalAnswerDelivery::Text(text, status)),
+                Err(bad_outcome) => {
+                    warn!(
+                        bad_outcome = ?bad_outcome,
+                        "agent_turn: final_answer was unusable; reprompting once"
+                    );
+                }
+            },
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "agent_turn: final_answer arguments were invalid; reprompting once"
+                );
+            }
+        }
+
+        match self
+            .reprompt_for_final_answer_delivery(
+                msg,
+                session,
+                memory_override,
+                provider,
+                model,
+                options,
+            )
+            .await?
+        {
+            Some(delivery) => Ok(delivery),
+            None => {
+                warn!("agent_turn: final_answer reprompt could not run");
+                Ok(FinalAnswerDelivery::Fallback {
+                    reason: "unexpected_outcome",
+                })
+            }
+        }
+    }
+
+    async fn reprompt_for_final_answer_delivery(
+        &self,
+        msg: &InboundMessage,
+        session: &Session,
+        memory_override: Option<&str>,
+        provider: &Arc<dyn LLMProvider>,
+        model: Option<&str>,
+        options: &ChatOptions,
+    ) -> Result<Option<FinalAnswerDelivery>> {
+        let Some(parsed) = self
+            .reprompt_for_final_answer(msg, session, memory_override, provider, model, options)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        match parsed {
+            Ok(call) => match self.validate_final_answer_call(call) {
+                Ok((text, status)) => Ok(Some(FinalAnswerDelivery::Text(text, status))),
+                Err(bad_outcome) => Ok(Some(FinalAnswerDelivery::Fallback {
+                    reason: phase0_fallback_reason(&bad_outcome, false),
+                })),
+            },
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "agent_turn: final_answer reprompt returned invalid arguments"
+                );
+                Ok(Some(FinalAnswerDelivery::Fallback {
+                    reason: "unexpected_outcome",
+                }))
+            }
+        }
+    }
+
+    async fn save_final_answer_and_return(
+        &self,
+        session: &mut Session,
+        text: String,
+        status: FinalAnswerStatus,
+    ) -> Result<String> {
+        session.add_message(final_answer_message(&text, &status));
+        self.agent.session_manager.save(session).await?;
+        Ok(text)
     }
 
     async fn refresh_anchored_summary_if_due(
@@ -257,7 +472,11 @@ impl<'a> Harness<'a> {
         let model = Some(model_string.as_str());
 
         // Get or create session
-        let mut session = self.agent.session_manager.get_or_create(&msg.session_key).await?;
+        let mut session = self
+            .agent
+            .session_manager
+            .get_or_create(&msg.session_key)
+            .await?;
 
         // Add the user message BEFORE compaction so compaction sees the full context.
         session.add_message(user_message);
@@ -298,7 +517,10 @@ impl<'a> Harness<'a> {
         // Pass an empty user_input string: the current user message is already
         // in session.messages above, so we must not add a duplicate plain-text
         // entry here.
-        let memory_override = self.agent.build_memory_override(&resolved_user_prompt).await;
+        let memory_override = self
+            .agent
+            .build_memory_override(&resolved_user_prompt)
+            .await;
         let mut messages = self
             .agent
             .build_resolved_messages(msg, &session, memory_override.as_deref())
@@ -373,11 +595,12 @@ impl<'a> Harness<'a> {
 
         // Check response cache before calling the provider.
         // The MutexGuard must be dropped before any .await to remain Send.
-        let cached_hit = if let (Some(ref cache_mutex), Some(ref key)) = (&self.agent.cache, &cache_key) {
-            cache_mutex.lock().ok().and_then(|mut c| c.get(key))
-        } else {
-            None
-        };
+        let cached_hit =
+            if let (Some(ref cache_mutex), Some(ref key)) = (&self.agent.cache, &cache_key) {
+                cache_mutex.lock().ok().and_then(|mut c| c.get(key))
+            } else {
+                None
+            };
         if let Some(cached_response) = cached_hit {
             debug!("Cache hit for initial prompt");
             // User message was already added to session before build_messages.
@@ -523,6 +746,39 @@ impl<'a> Harness<'a> {
         };
 
         while response.has_tool_calls() && iteration < max_iterations {
+            if let Some(final_answer) = self.final_answer_call_from_response(&response).await {
+                if response.tool_calls.len() > 1 {
+                    warn!(
+                        tool_calls = response.tool_calls.len(),
+                        "agent_turn: final_answer appeared with other tools; ignoring the rest"
+                    );
+                }
+                match self
+                    .handle_final_answer_or_reprompt(
+                        final_answer,
+                        msg,
+                        &session,
+                        memory_override.as_deref(),
+                        &provider,
+                        model,
+                        &options,
+                    )
+                    .await?
+                {
+                    FinalAnswerDelivery::Text(text, status) => {
+                        return self
+                            .save_final_answer_and_return(&mut session, text, status)
+                            .await;
+                    }
+                    FinalAnswerDelivery::Fallback { reason } => {
+                        let fallback =
+                            phase0_fallback_message(reason, iteration, tool_calls_total, false);
+                        session.add_message(fallback);
+                        self.agent.session_manager.save(&session).await?;
+                        return Ok(PHASE0_FALLBACK_CONTENT.to_string());
+                    }
+                }
+            }
             iteration += 1;
             debug!("Tool iteration {} of {}", iteration, max_iterations);
 
@@ -612,10 +868,13 @@ impl<'a> Harness<'a> {
                 false
             };
 
-            let run_sequential = (!trusted_local_session
-                && approval_handler.is_some()
-                && any_approval_gated_tool)
-                || needs_sequential_execution(&self.agent.tools, &response.tool_calls, lazy_tool_schema)
+            let run_sequential =
+                (!trusted_local_session && approval_handler.is_some() && any_approval_gated_tool)
+                    || needs_sequential_execution(
+                        &self.agent.tools,
+                        &response.tool_calls,
+                        lazy_tool_schema,
+                    )
                     .await;
             let tool_timeout_secs = if self.agent.config.agents.defaults.tool_timeout_secs > 0 {
                 self.agent.config.agents.defaults.tool_timeout_secs
@@ -1362,6 +1621,54 @@ impl<'a> Harness<'a> {
         // here (classify_final_content does not return that variant) so we
         // only need to look at content shape.
         let initial_outcome = classify_final_content(&response.content);
+        if iteration > 0 && matches!(initial_outcome, TurnOutcome::FinalAnswer(_)) {
+            warn!(
+                iterations = iteration,
+                "agent_turn: accepted implicit final content after tool loop"
+            );
+            metrics_collector.record_harness_implicit_termination();
+        }
+        if iteration > 0
+            && matches!(
+                initial_outcome,
+                TurnOutcome::EmptyAnswer | TurnOutcome::ProviderMarkupOnly
+            )
+        {
+            warn!(
+                iterations = iteration,
+                "agent_turn: tool loop ended without final_answer and unusable content; reprompting once"
+            );
+            if let Some(delivery) = self
+                .reprompt_for_final_answer_delivery(
+                    msg,
+                    &session,
+                    memory_override.as_deref(),
+                    &provider,
+                    model,
+                    &options,
+                )
+                .await?
+            {
+                match delivery {
+                    FinalAnswerDelivery::Text(text, status) => {
+                        return self
+                            .save_final_answer_and_return(&mut session, text, status)
+                            .await;
+                    }
+                    FinalAnswerDelivery::Fallback { reason } => {
+                        let fallback = phase0_fallback_message(
+                            reason,
+                            iteration,
+                            tool_calls_total,
+                            max_iter_reached,
+                        );
+                        session.add_message(fallback);
+                        self.agent.session_manager.save(&session).await?;
+                        return Ok(PHASE0_FALLBACK_CONTENT.to_string());
+                    }
+                }
+            }
+        }
         let cfg_defaults = &self.agent.config.agents.defaults;
         let synthesis_trigger = classify_synthesis_trigger(
             &initial_outcome,
@@ -1376,13 +1683,7 @@ impl<'a> Harness<'a> {
         // an empty / markup-only synthesis response still fails explicitly.
         let mut synthesis_failed = false;
         let outcome = if let Some(trigger) = synthesis_trigger {
-            let provider_opt = self
-                .agent
-                .provider
-                .read()
-                .await
-                .as_ref()
-                .map(Arc::clone);
+            let provider_opt = self.agent.provider.read().await.as_ref().map(Arc::clone);
             match provider_opt {
                 Some(provider) => {
                     info!(
@@ -1563,7 +1864,11 @@ impl<'a> Harness<'a> {
         let model_string = self.agent.resolve_model_for_message(msg);
         let model = Some(model_string.as_str());
 
-        let mut session = self.agent.session_manager.get_or_create(&msg.session_key).await?;
+        let mut session = self
+            .agent
+            .session_manager
+            .get_or_create(&msg.session_key)
+            .await?;
 
         // Add the user message BEFORE compaction so compaction sees the full context.
         session.add_message(user_message);
@@ -1600,7 +1905,10 @@ impl<'a> Harness<'a> {
             .await;
 
         // Pass an empty user_input: the current user message is already in session.
-        let memory_override = self.agent.build_memory_override(&resolved_user_prompt).await;
+        let memory_override = self
+            .agent
+            .build_memory_override(&resolved_user_prompt)
+            .await;
         let mut messages = self
             .agent
             .build_resolved_messages(msg, &session, memory_override.as_deref())
@@ -1751,7 +2059,8 @@ impl<'a> Harness<'a> {
                 usage.cached_tokens as u64,
                 usage.cache_creation_tokens as u64,
             );
-            self.agent.token_budget
+            self.agent
+                .token_budget
                 .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
         }
 
@@ -1772,6 +2081,52 @@ impl<'a> Harness<'a> {
         };
 
         while response.has_tool_calls() && iteration < max_iterations {
+            if let Some(final_answer) = self.final_answer_call_from_response(&response).await {
+                if response.tool_calls.len() > 1 {
+                    warn!(
+                        tool_calls = response.tool_calls.len(),
+                        "agent_turn(streaming): final_answer appeared with other tools; ignoring the rest"
+                    );
+                }
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                match self
+                    .handle_final_answer_or_reprompt(
+                        final_answer,
+                        msg,
+                        &session,
+                        memory_override.as_deref(),
+                        &provider,
+                        model,
+                        &options,
+                    )
+                    .await?
+                {
+                    FinalAnswerDelivery::Text(text, status) => {
+                        session.add_message(final_answer_message(&text, &status));
+                        self.agent.session_manager.save(&session).await?;
+                        let _ = tx
+                            .send(StreamEvent::Done {
+                                content: text,
+                                usage: response.usage.clone(),
+                            })
+                            .await;
+                        return Ok(rx);
+                    }
+                    FinalAnswerDelivery::Fallback { reason } => {
+                        let fallback =
+                            phase0_fallback_message(reason, iteration, tool_calls_total, false);
+                        session.add_message(fallback);
+                        self.agent.session_manager.save(&session).await?;
+                        let _ = tx
+                            .send(StreamEvent::Done {
+                                content: PHASE0_FALLBACK_CONTENT.to_string(),
+                                usage: None,
+                            })
+                            .await;
+                        return Ok(rx);
+                    }
+                }
+            }
             iteration += 1;
             debug!("Tool iteration {} of {}", iteration, max_iterations);
 
@@ -1858,10 +2213,13 @@ impl<'a> Harness<'a> {
                 false
             };
 
-            let run_sequential = (!trusted_local_session
-                && approval_handler.is_some()
-                && any_approval_gated_tool)
-                || needs_sequential_execution(&self.agent.tools, &response.tool_calls, lazy_tool_schema)
+            let run_sequential =
+                (!trusted_local_session && approval_handler.is_some() && any_approval_gated_tool)
+                    || needs_sequential_execution(
+                        &self.agent.tools,
+                        &response.tool_calls,
+                        lazy_tool_schema,
+                    )
                     .await;
             let tool_timeout_secs = if self.agent.config.agents.defaults.tool_timeout_secs > 0 {
                 self.agent.config.agents.defaults.tool_timeout_secs
@@ -2275,7 +2633,8 @@ impl<'a> Harness<'a> {
             }
 
             // Increment tool call counter after execution.
-            self.agent.tool_call_limit
+            self.agent
+                .tool_call_limit
                 .increment(response.tool_calls.len() as u32);
             // If the limit is now hit, clear tool_calls so the post-loop code
             // enters the streaming final call branch, which re-issues the
@@ -2460,7 +2819,8 @@ impl<'a> Harness<'a> {
                     usage.cached_tokens as u64,
                     usage.cache_creation_tokens as u64,
                 );
-                self.agent.token_budget
+                self.agent
+                    .token_budget
                     .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
             }
         }
@@ -2517,8 +2877,7 @@ impl<'a> Harness<'a> {
             let synthesis_messages = messages.clone();
             let synthesis_model = model.map(str::to_string);
             let synthesis_options = options.clone();
-            let synthesis_on_empty =
-                self.agent.config.agents.defaults.final_synthesis_on_empty;
+            let synthesis_on_empty = self.agent.config.agents.defaults.final_synthesis_on_empty;
 
             let stream_rx = provider
                 .chat_stream(messages, tool_definitions, model, options)
@@ -2574,6 +2933,13 @@ impl<'a> Harness<'a> {
                             let outcome = classify_final_content(&content);
                             match outcome {
                                 TurnOutcome::FinalAnswer(_) => {
+                                    if fallback_iterations > 0 {
+                                        tracing::warn!(
+                                            iterations = fallback_iterations,
+                                            "agent_turn(streaming): accepted implicit final content after tool loop"
+                                        );
+                                        metrics_collector.record_harness_implicit_termination();
+                                    }
                                     // Flush any content the guard withheld
                                     // because it started with `<`. The
                                     // classification verdict confirmed it is
@@ -2581,15 +2947,11 @@ impl<'a> Harness<'a> {
                                     // forward it now as a single Delta
                                     // before the terminating Done.
                                     if let Some(buffered) = markup_guard.take_buffered() {
-                                        let _ = out_tx
-                                            .send(StreamEvent::Delta(buffered))
-                                            .await;
+                                        let _ = out_tx.send(StreamEvent::Delta(buffered)).await;
                                     }
                                     session.add_message(Message::assistant(&content));
                                     let _ = session_manager.save(&session).await;
-                                    let _ = out_tx
-                                        .send(StreamEvent::Done { content, usage })
-                                        .await;
+                                    let _ = out_tx.send(StreamEvent::Done { content, usage }).await;
                                 }
                                 bad_outcome @ (TurnOutcome::EmptyAnswer
                                 | TurnOutcome::ProviderMarkupOnly) => {
@@ -2725,16 +3087,15 @@ impl<'a> Harness<'a> {
                                             .await;
                                     }
                                 }
-                                TurnOutcome::ToolCalls(_) => unreachable!(
-                                    "classify_final_content cannot return ToolCalls"
-                                ),
+                                TurnOutcome::ToolCalls(_) => {
+                                    unreachable!("classify_final_content cannot return ToolCalls")
+                                }
                             }
                             return;
                         }
                         StreamEvent::ToolCalls(tool_calls) => {
                             // Unexpected tool calls during streaming — emit and let caller handle
-                            let _ =
-                                out_tx.send(StreamEvent::ToolCalls(tool_calls)).await;
+                            let _ = out_tx.send(StreamEvent::ToolCalls(tool_calls)).await;
                             return;
                         }
                         StreamEvent::Delta(text) => {
@@ -2744,11 +3105,7 @@ impl<'a> Harness<'a> {
                             // or the initial leading-whitespace flush), or
                             // None while it is still withholding content.
                             if let Some(forward) = markup_guard.on_delta(&text) {
-                                if out_tx
-                                    .send(StreamEvent::Delta(forward))
-                                    .await
-                                    .is_err()
-                                {
+                                if out_tx.send(StreamEvent::Delta(forward)).await.is_err() {
                                     return;
                                 }
                             }
@@ -2869,9 +3226,9 @@ impl<'a> Harness<'a> {
                         })
                         .await;
                 }
-                TurnOutcome::ToolCalls(_) => unreachable!(
-                    "classify_final_content cannot return ToolCalls"
-                ),
+                TurnOutcome::ToolCalls(_) => {
+                    unreachable!("classify_final_content cannot return ToolCalls")
+                }
             }
             Ok(rx)
         }

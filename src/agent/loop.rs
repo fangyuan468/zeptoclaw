@@ -1494,6 +1494,21 @@ mod tests {
         stream_content: &'static str,
     }
 
+    struct ToolThenFinalAnswerProvider {
+        calls: std::sync::Mutex<u8>,
+        final_content: &'static str,
+        final_status: &'static str,
+    }
+
+    struct ToolThenInvalidFinalAnswerProvider {
+        calls: std::sync::Mutex<u8>,
+        first_final_content: &'static str,
+        reprompt_final_content: &'static str,
+        reprompt_final_status: &'static str,
+    }
+
+    struct ConcurrentFinalAnswerProvider;
+
     #[derive(Clone, Debug)]
     struct RecordedProviderCall {
         is_summary: bool,
@@ -1651,6 +1666,129 @@ mod tests {
                 })
                 .await;
             Ok(rx)
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ToolThenFinalAnswerProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _model: Option<&str>,
+            _options: ChatOptions,
+        ) -> Result<LLMResponse> {
+            let mut calls = self.calls.lock().expect("provider call counter poisoned");
+            *calls += 1;
+            if *calls == 1 {
+                Ok(LLMResponse::with_tools(
+                    "",
+                    vec![LLMToolCall::new("call_1", "read_file", "{}")],
+                ))
+            } else {
+                Ok(LLMResponse::with_tools(
+                    "",
+                    vec![LLMToolCall::new(
+                        "call_final",
+                        "final_answer",
+                        &format!(
+                            r#"{{"content":"{}","status":"{}"}}"#,
+                            self.final_content, self.final_status
+                        ),
+                    )],
+                ))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ToolThenInvalidFinalAnswerProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _model: Option<&str>,
+            _options: ChatOptions,
+        ) -> Result<LLMResponse> {
+            let mut calls = self.calls.lock().expect("provider call counter poisoned");
+            *calls += 1;
+            if *calls == 1 {
+                Ok(LLMResponse::with_tools(
+                    "",
+                    vec![LLMToolCall::new("call_1", "read_file", "{}")],
+                ))
+            } else if *calls == 2 {
+                Ok(LLMResponse::with_tools(
+                    "",
+                    vec![LLMToolCall::new(
+                        "call_final_bad",
+                        "final_answer",
+                        &format!(
+                            r#"{{"content":"{}","status":"complete"}}"#,
+                            self.first_final_content
+                        ),
+                    )],
+                ))
+            } else {
+                Ok(LLMResponse::with_tools(
+                    "",
+                    vec![LLMToolCall::new(
+                        "call_final_reprompt",
+                        "final_answer",
+                        &format!(
+                            r#"{{"content":"{}","status":"{}"}}"#,
+                            self.reprompt_final_content, self.reprompt_final_status
+                        ),
+                    )],
+                ))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ConcurrentFinalAnswerProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _model: Option<&str>,
+            _options: ChatOptions,
+        ) -> Result<LLMResponse> {
+            Ok(LLMResponse::with_tools(
+                "",
+                vec![
+                    LLMToolCall::new(
+                        "call_final",
+                        "final_answer",
+                        r#"{"content":"done from final tool","status":"complete"}"#,
+                    ),
+                    LLMToolCall::new("call_read", "read_file", "{}"),
+                ],
+            ))
         }
     }
 
@@ -2721,6 +2859,342 @@ tail line
         let (content, _) = collect_stream_done(stream).await;
 
         assert!(content.starts_with("Sorry, I could not produce a displayable final answer"));
+    }
+
+    #[tokio::test]
+    async fn test_process_message_delivers_structured_final_answer_after_tool_loop() {
+        let config = Config::default();
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolThenFinalAnswerProvider {
+                calls: std::sync::Mutex::new(0),
+                final_content: "done via final_answer",
+                final_status: "complete",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(crate::tools::FinalAnswerTool))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "final-answer-meta", "run a tool");
+        let content = agent
+            .process_message(&msg)
+            .await
+            .expect("final_answer should terminate the turn");
+
+        assert_eq!(content, "done via final_answer");
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+        let session = agent
+            .session_manager
+            .get_or_create("cli:final-answer-meta")
+            .await
+            .expect("session should load");
+        let metadata = &session
+            .messages
+            .last()
+            .expect("assistant message should be recorded")
+            .metadata;
+        assert_eq!(
+            metadata.get("final_answer_status").and_then(|v| v.as_str()),
+            Some("complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_ignores_concurrent_tools_when_final_answer_present() {
+        let config = Config::default();
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ConcurrentFinalAnswerProvider))
+            .await;
+        agent
+            .register_tool(Box::new(crate::tools::FinalAnswerTool))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "final-answer-concurrent", "finish");
+        let content = agent
+            .process_message(&msg)
+            .await
+            .expect("final_answer should terminate the turn");
+
+        assert_eq!(content, "done from final tool");
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_message_streaming_delivers_structured_final_answer_after_tool_loop() {
+        let config = Config::default();
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolThenFinalAnswerProvider {
+                calls: std::sync::Mutex::new(0),
+                final_content: "stream done via final_answer",
+                final_status: "partial",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(crate::tools::FinalAnswerTool))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "final-answer-stream", "run a tool");
+        let stream = agent
+            .process_message_streaming(&msg)
+            .await
+            .expect("streaming final_answer should terminate the turn");
+        let (content, _) = collect_stream_done(stream).await;
+
+        assert_eq!(content, "stream done via final_answer");
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+        let session = agent
+            .session_manager
+            .get_or_create("cli:final-answer-stream")
+            .await
+            .expect("session should load");
+        let metadata = &session
+            .messages
+            .last()
+            .expect("assistant message should be recorded")
+            .metadata;
+        assert_eq!(
+            metadata.get("final_answer_status").and_then(|v| v.as_str()),
+            Some("partial")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_reprompts_invalid_final_answer_successfully() {
+        let config = Config::default();
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolThenInvalidFinalAnswerProvider {
+                calls: std::sync::Mutex::new(0),
+                first_final_content: "<minimax:tool_call>{}</minimax:tool_call>",
+                reprompt_final_content: "reprompt success",
+                reprompt_final_status: "complete",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(crate::tools::FinalAnswerTool))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "final-answer-reprompt", "run a tool");
+        let content = agent
+            .process_message(&msg)
+            .await
+            .expect("reprompted final_answer should terminate the turn");
+
+        assert_eq!(content, "reprompt success");
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+        let session = agent
+            .session_manager
+            .get_or_create("cli:final-answer-reprompt")
+            .await
+            .expect("session should load");
+        let metadata = &session
+            .messages
+            .last()
+            .expect("assistant message should be recorded")
+            .metadata;
+        assert_eq!(
+            metadata.get("final_answer_status").and_then(|v| v.as_str()),
+            Some("complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_reprompt_invalid_final_answer_falls_back() {
+        let config = Config::default();
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolThenInvalidFinalAnswerProvider {
+                calls: std::sync::Mutex::new(0),
+                first_final_content: "",
+                reprompt_final_content: "",
+                reprompt_final_status: "complete",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(crate::tools::FinalAnswerTool))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new(
+            "cli",
+            "user",
+            "final-answer-reprompt-fallback",
+            "run a tool",
+        );
+        let content = agent
+            .process_message(&msg)
+            .await
+            .expect("invalid reprompt should produce phase0 fallback");
+
+        assert!(content.starts_with("Sorry, I could not produce a displayable final answer"));
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+        let session = agent
+            .session_manager
+            .get_or_create("cli:final-answer-reprompt-fallback")
+            .await
+            .expect("session should load");
+        let metadata = &session
+            .messages
+            .last()
+            .expect("fallback message should be recorded")
+            .metadata;
+        assert_eq!(
+            metadata.get("harness_fallback").and_then(|v| v.as_str()),
+            Some("phase0")
+        );
+        assert_eq!(
+            metadata.get("fallback_reason").and_then(|v| v.as_str()),
+            Some("synthesis_empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_records_implicit_termination_metric() {
+        let config = Config::default();
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolThenTextProvider {
+                calls: std::sync::Mutex::new(0),
+                tool_name: "read_file",
+                tool_args: "{}",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "implicit-final", "run a tool");
+        let content = agent
+            .process_message(&msg)
+            .await
+            .expect("implicit final content should still be accepted");
+
+        assert_eq!(content, "done");
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            agent
+                .metrics_collector()
+                .harness_implicit_termination_total(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_message_streaming_records_implicit_termination_metric() {
+        let config = Config::default();
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+        let tool_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        agent
+            .set_provider(Box::new(ToolThenBadStreamProvider {
+                calls: std::sync::Mutex::new(0),
+                stream_content: "done",
+            }))
+            .await;
+        agent
+            .register_tool(Box::new(InstrumentedTool {
+                name: "read_file",
+                category: ToolCategory::FilesystemRead,
+                calls: Arc::clone(&tool_calls),
+                fail: false,
+                last_args: None,
+            }))
+            .await;
+
+        let msg = InboundMessage::new("cli", "user", "implicit-final-stream", "run a tool");
+        let stream = agent
+            .process_message_streaming(&msg)
+            .await
+            .expect("streaming implicit final content should still be accepted");
+        let (content, _) = collect_stream_done(stream).await;
+
+        assert_eq!(content, "done");
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            agent
+                .metrics_collector()
+                .harness_implicit_termination_total(),
+            1
+        );
     }
 
     #[tokio::test]

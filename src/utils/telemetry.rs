@@ -66,6 +66,7 @@ pub fn render(collector: &MetricsCollector, format: &TelemetryFormat) -> String 
 /// - `zeptoclaw_tool_duration_seconds_max` (gauge)
 /// - `zeptoclaw_tokens_input_total` (counter)
 /// - `zeptoclaw_tokens_output_total` (counter)
+/// - `zeptoclaw_harness_implicit_termination_total` (counter)
 /// - `zeptoclaw_session_duration_seconds` (gauge)
 pub fn render_prometheus(collector: &MetricsCollector) -> String {
     let mut out = String::new();
@@ -143,6 +144,13 @@ pub fn render_prometheus(collector: &MetricsCollector) -> String {
     out.push_str("# TYPE zeptoclaw_tokens_output_total counter\n");
     out.push_str(&format!("zeptoclaw_tokens_output_total {}\n", tokens_out));
 
+    out.push_str("# HELP zeptoclaw_harness_implicit_termination_total Total accepted implicit final answers after a tool loop.\n");
+    out.push_str("# TYPE zeptoclaw_harness_implicit_termination_total counter\n");
+    out.push_str(&format!(
+        "zeptoclaw_harness_implicit_termination_total {}\n",
+        collector.harness_implicit_termination_total()
+    ));
+
     // --- session duration ---
     out.push_str("# HELP zeptoclaw_session_duration_seconds Session uptime in seconds.\n");
     out.push_str("# TYPE zeptoclaw_session_duration_seconds gauge\n");
@@ -197,6 +205,7 @@ pub fn render_json(collector: &MetricsCollector) -> String {
         "tools": tools_json,
         "tokens_input_total": tokens_in,
         "tokens_output_total": tokens_out,
+        "zeptoclaw_harness_implicit_termination_total": collector.harness_implicit_termination_total(),
         "session_duration_seconds": collector.session_duration().as_secs_f64(),
     });
 
@@ -334,6 +343,7 @@ mod tests {
             "zeptoclaw_tool_duration_seconds_max",
             "zeptoclaw_tokens_input_total",
             "zeptoclaw_tokens_output_total",
+            "zeptoclaw_harness_implicit_termination_total",
             "zeptoclaw_session_duration_seconds",
         ];
 
@@ -365,6 +375,7 @@ mod tests {
         assert_eq!(parsed["tools"], serde_json::json!({}));
         assert_eq!(parsed["tokens_input_total"], 0);
         assert_eq!(parsed["tokens_output_total"], 0);
+        assert_eq!(parsed["zeptoclaw_harness_implicit_termination_total"], 0);
         assert!(parsed["session_duration_seconds"].as_f64().unwrap() >= 0.0);
     }
 
@@ -389,6 +400,7 @@ mod tests {
 
         assert_eq!(parsed["tokens_input_total"], 500);
         assert_eq!(parsed["tokens_output_total"], 200);
+        assert_eq!(parsed["zeptoclaw_harness_implicit_termination_total"], 0);
     }
 
     // -- render dispatches correctly --
