@@ -71,6 +71,8 @@ pub fn render(collector: &MetricsCollector, format: &TelemetryFormat) -> String 
 /// - `zeptoclaw_harness_plan_revised_total` (counter)
 /// - `zeptoclaw_harness_disorder_advisory_total` (counter)
 /// - `zeptoclaw_harness_disorder_advisory_ignored_total` (counter)
+/// - `zeptoclaw_harness_max_iter_reached_total` (counter)
+/// - `zeptoclaw_synthesis_legacy_invoked_total` (counter)
 /// - `zeptoclaw_session_duration_seconds` (gauge)
 pub fn render_prometheus(collector: &MetricsCollector) -> String {
     let mut out = String::new();
@@ -193,6 +195,20 @@ pub fn render_prometheus(collector: &MetricsCollector) -> String {
         collector.harness_disorder_advisory_ignored_total()
     ));
 
+    out.push_str("# HELP zeptoclaw_harness_max_iter_reached_total Total turns that reached the max tool iteration crash guard.\n");
+    out.push_str("# TYPE zeptoclaw_harness_max_iter_reached_total counter\n");
+    out.push_str(&format!(
+        "zeptoclaw_harness_max_iter_reached_total {}\n",
+        collector.harness_max_iter_reached_total()
+    ));
+
+    out.push_str("# HELP zeptoclaw_synthesis_legacy_invoked_total Total legacy final synthesis fallback invocations.\n");
+    out.push_str("# TYPE zeptoclaw_synthesis_legacy_invoked_total counter\n");
+    out.push_str(&format!(
+        "zeptoclaw_synthesis_legacy_invoked_total {}\n",
+        collector.synthesis_legacy_invoked_total()
+    ));
+
     // --- session duration ---
     out.push_str("# HELP zeptoclaw_session_duration_seconds Session uptime in seconds.\n");
     out.push_str("# TYPE zeptoclaw_session_duration_seconds gauge\n");
@@ -252,6 +268,8 @@ pub fn render_json(collector: &MetricsCollector) -> String {
         "zeptoclaw_harness_plan_revised_total": collector.harness_plan_revised_total(),
         "zeptoclaw_harness_disorder_advisory_total": collector.harness_disorder_advisory_totals(),
         "zeptoclaw_harness_disorder_advisory_ignored_total": collector.harness_disorder_advisory_ignored_total(),
+        "zeptoclaw_harness_max_iter_reached_total": collector.harness_max_iter_reached_total(),
+        "zeptoclaw_synthesis_legacy_invoked_total": collector.synthesis_legacy_invoked_total(),
         "session_duration_seconds": collector.session_duration().as_secs_f64(),
     });
 
@@ -356,6 +374,8 @@ mod tests {
         collector.record_tool_call("shell", Duration::from_millis(300), false);
         collector.record_tool_call("read_file", Duration::from_millis(5), true);
         collector.record_tokens(1500, 800);
+        collector.record_harness_max_iter_reached();
+        collector.record_synthesis_legacy_invoked();
 
         let output = render_prometheus(&collector);
 
@@ -370,6 +390,10 @@ mod tests {
         // Tokens.
         assert!(output.contains("zeptoclaw_tokens_input_total 1500"));
         assert!(output.contains("zeptoclaw_tokens_output_total 800"));
+
+        // Harness crash-guard counters.
+        assert!(output.contains("zeptoclaw_harness_max_iter_reached_total 1"));
+        assert!(output.contains("zeptoclaw_synthesis_legacy_invoked_total 1"));
     }
 
     // -- render_prometheus contains expected metric names and labels --
@@ -394,6 +418,8 @@ mod tests {
             "zeptoclaw_harness_plan_revised_total",
             "zeptoclaw_harness_disorder_advisory_total",
             "zeptoclaw_harness_disorder_advisory_ignored_total",
+            "zeptoclaw_harness_max_iter_reached_total",
+            "zeptoclaw_synthesis_legacy_invoked_total",
             "zeptoclaw_session_duration_seconds",
         ];
 
@@ -436,6 +462,8 @@ mod tests {
             parsed["zeptoclaw_harness_disorder_advisory_ignored_total"],
             0
         );
+        assert_eq!(parsed["zeptoclaw_harness_max_iter_reached_total"], 0);
+        assert_eq!(parsed["zeptoclaw_synthesis_legacy_invoked_total"], 0);
         assert!(parsed["session_duration_seconds"].as_f64().unwrap() >= 0.0);
     }
 
@@ -447,6 +475,8 @@ mod tests {
         collector.record_tool_call("shell", Duration::from_millis(100), true);
         collector.record_tool_call("shell", Duration::from_millis(300), false);
         collector.record_tokens(500, 200);
+        collector.record_harness_max_iter_reached();
+        collector.record_synthesis_legacy_invoked();
 
         let output = render_json(&collector);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -462,6 +492,8 @@ mod tests {
         assert_eq!(parsed["tokens_output_total"], 200);
         assert_eq!(parsed["zeptoclaw_harness_implicit_termination_total"], 0);
         assert_eq!(parsed["zeptoclaw_harness_plan_proposed_total"], 0);
+        assert_eq!(parsed["zeptoclaw_harness_max_iter_reached_total"], 1);
+        assert_eq!(parsed["zeptoclaw_synthesis_legacy_invoked_total"], 1);
     }
 
     // -- render dispatches correctly --

@@ -770,7 +770,7 @@ pub struct AgentDefaults {
     pub max_tokens: u32,
     /// Temperature for generation
     pub temperature: f32,
-    /// Maximum tool iterations per turn
+    /// Crash guard maximum tool iterations per turn
     pub max_tool_iterations: u32,
     /// Maximum wall-clock time (seconds) for a single agent run.
     pub agent_timeout_secs: u64,
@@ -869,7 +869,7 @@ impl Default for AgentDefaults {
             model: COMPILE_TIME_DEFAULT_MODEL.to_string(),
             max_tokens: 8192,
             temperature: 0.7,
-            max_tool_iterations: 20,
+            max_tool_iterations: 40,
             agent_timeout_secs: 300,
             tool_timeout_secs: 0,
             message_queue_mode: MessageQueueMode::default(),
