@@ -36,11 +36,12 @@ use super::format::{
 use super::harness_state::{HarnessTurnState, PROPOSE_PLAN_TOOL_NAME, REVISE_PLAN_TOOL_NAME};
 use super::inbound::inbound_to_message;
 use super::loop_events::{
-    publish_tool_call_finished_event, publish_tool_call_started_event, ThinkingScope,
-    ToolCallOutcome,
+    publish_telemetry_increment_event, publish_tool_call_finished_event,
+    publish_tool_call_started_event, ThinkingScope, ToolCallOutcome,
 };
 use super::observations::{ToolObservation, ToolObservationKind};
 use super::r#loop::{AgentLoop, AnchoredSummaryState};
+use super::telemetry_events;
 use super::tool_feedback::{ToolFeedback, ToolFeedbackPhase};
 use super::tool_helpers::{
     check_loop_guard, check_loop_guard_outcomes, is_trusted_local_session,
@@ -1714,6 +1715,14 @@ impl<'a> Harness<'a> {
         let max_iter_reached = iteration >= max_iterations && response.has_tool_calls();
         if max_iter_reached {
             metrics_collector.record_harness_max_iter_reached();
+            publish_telemetry_increment_event(
+                &self.agent.bus,
+                Some(&msg.channel),
+                Some(&msg.chat_id),
+                telemetry_events::HARNESS_MAX_ITER_REACHED,
+                "max_iter",
+            )
+            .await;
             info!(
                 iterations = iteration,
                 "Tool loop reached maximum iterations, attempting final synthesis"
@@ -1799,6 +1808,14 @@ impl<'a> Harness<'a> {
             match provider_opt {
                 Some(provider) => {
                     metrics_collector.record_synthesis_legacy_invoked();
+                    publish_telemetry_increment_event(
+                        &self.agent.bus,
+                        Some(&msg.channel),
+                        Some(&msg.chat_id),
+                        telemetry_events::SYNTHESIS_LEGACY_INVOKED,
+                        trigger,
+                    )
+                    .await;
                     info!(
                         reason = trigger,
                         iterations = iteration,
@@ -3059,6 +3076,9 @@ impl<'a> Harness<'a> {
             let fallback_iterations = iteration;
             let fallback_tool_calls_total = tool_calls_total;
             let fallback_tool_limit_hit = tool_limit_hit;
+            let telemetry_bus = Arc::clone(&self.agent.bus);
+            let telemetry_channel = msg.channel.clone();
+            let telemetry_chat_id = msg.chat_id.clone();
 
             tokio::spawn(async move {
                 let mut session = session_clone;
@@ -3129,6 +3149,14 @@ impl<'a> Harness<'a> {
                                     };
                                     if synthesis_on_empty {
                                         metrics_collector.record_synthesis_legacy_invoked();
+                                        publish_telemetry_increment_event(
+                                            &telemetry_bus,
+                                            Some(&telemetry_channel),
+                                            Some(&telemetry_chat_id),
+                                            telemetry_events::SYNTHESIS_LEGACY_INVOKED,
+                                            reason,
+                                        )
+                                        .await;
                                         tracing::warn!(
                                             content_len,
                                             buffered = markup_guard.is_buffering(),
@@ -3295,6 +3323,14 @@ impl<'a> Harness<'a> {
             // tools-disabled synthesis turn before failing.
             if iteration >= max_iterations {
                 metrics_collector.record_harness_max_iter_reached();
+                publish_telemetry_increment_event(
+                    &self.agent.bus,
+                    Some(&msg.channel),
+                    Some(&msg.chat_id),
+                    telemetry_events::HARNESS_MAX_ITER_REACHED,
+                    "max_iter",
+                )
+                .await;
             }
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let cfg_defaults = &self.agent.config.agents.defaults;
@@ -3309,6 +3345,14 @@ impl<'a> Harness<'a> {
             let mut synthesis_failed = false;
             let (outcome, done_usage) = if let Some(label) = trigger {
                 metrics_collector.record_synthesis_legacy_invoked();
+                publish_telemetry_increment_event(
+                    &self.agent.bus,
+                    Some(&msg.channel),
+                    Some(&msg.chat_id),
+                    telemetry_events::SYNTHESIS_LEGACY_INVOKED,
+                    label,
+                )
+                .await;
                 info!(
                     reason = label,
                     tool_call_count = response.tool_calls.len(),
