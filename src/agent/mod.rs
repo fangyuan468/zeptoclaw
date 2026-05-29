@@ -75,6 +75,7 @@ pub mod pipeline;
 pub mod observations;
 pub mod scratchpad;
 pub mod synthesis;
+mod telemetry_events;
 pub mod tool_call_limit;
 pub mod tool_feedback;
 mod tool_helpers;

@@ -65,6 +65,13 @@ struct ToolCallStatusPayload {
     result_preview: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TelemetryIncrementPayload<'a> {
+    amount: u64,
+    reason: &'a str,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ThinkingEventToken {
     thought_id: String,
@@ -183,6 +190,17 @@ pub(super) async fn publish_thinking_status_event(
     .await;
 }
 
+pub(super) async fn publish_telemetry_increment_event(
+    bus: &Arc<MessageBus>,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    event_name: &str,
+    reason: &str,
+) {
+    let payload = TelemetryIncrementPayload { amount: 1, reason };
+    publish_custom_ui_event(bus, channel, chat_id, event_name, &payload, None).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_tool_call_status_event(
     bus: &Arc<MessageBus>,
@@ -227,6 +245,53 @@ pub(super) async fn publish_tool_call_status_event(
         summary.as_deref(),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::telemetry_events;
+    use crate::bus::message::{
+        OutboundMessageKind, OUTBOUND_CUSTOM_NAME_KEY, OUTBOUND_CUSTOM_PAYLOAD_KEY,
+    };
+
+    #[tokio::test]
+    async fn publish_telemetry_increment_event_emits_custom_outbound() {
+        let bus = Arc::new(MessageBus::new());
+
+        publish_telemetry_increment_event(
+            &bus,
+            Some(ACP_HTTP_CHANNEL),
+            Some("chat_1"),
+            telemetry_events::HARNESS_MAX_ITER_REACHED,
+            "max_iter",
+        )
+        .await;
+
+        let outbound = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            bus.consume_outbound(),
+        )
+        .await
+        .expect("timeout waiting for outbound message")
+        .expect("missing outbound message");
+        assert_eq!(outbound.kind, OutboundMessageKind::Custom);
+        assert_eq!(
+            outbound
+                .metadata
+                .get(OUTBOUND_CUSTOM_NAME_KEY)
+                .map(String::as_str),
+            Some(telemetry_events::HARNESS_MAX_ITER_REACHED)
+        );
+        let payload_raw = outbound
+            .metadata
+            .get(OUTBOUND_CUSTOM_PAYLOAD_KEY)
+            .expect("missing custom payload");
+        let payload_json: serde_json::Value =
+            serde_json::from_str(payload_raw).expect("custom payload must be json");
+        assert_eq!(payload_json["amount"], 1);
+        assert_eq!(payload_json["reason"], "max_iter");
+    }
 }
 
 pub(super) enum ToolCallOutcome<'a> {
